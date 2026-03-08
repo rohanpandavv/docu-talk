@@ -8,6 +8,7 @@ from pathlib import Path
 from pypdf import PdfReader
 from io import BytesIO
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import PromptTemplate
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR/".env")
@@ -42,3 +43,17 @@ async def upload_document(file: UploadFile = File(...)):
     
     vectorstore.add_texts(texts=chunks)
     return {"message": "Document indexed successfully!"}
+
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    docs = retriever.invoke(request.question)
+    context = "\n".join([doc.page_content for doc in docs])
+    
+    template = "Answer the following question based on this context. Context: {context} Question: {question}"
+    prompt = PromptTemplate.from_template(template)
+    
+    chain = prompt | llm
+    answer = chain.invoke({"context": context, "question": request.question})
+    
+    return {"answer": answer.content}
