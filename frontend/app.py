@@ -16,7 +16,13 @@ uploaded_file = st.file_uploader("Upload your research paper (PDF or TXT)", type
 if uploaded_file:
     if st.button("Process Document"):
         with st.spinner("Indexing document.."):
-            files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
+            files = {
+                "file": (
+                    uploaded_file.name,
+                    uploaded_file.getvalue(),
+                    uploaded_file.type
+                )
+            }
             response = requests.post(f"{BACKEND_URL}/upload", files=files)
             if response.status_code == 200:
                 st.success("Document indexed successfully!")
