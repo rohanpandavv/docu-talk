@@ -1,8 +1,8 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_anthropic import ChatAnthropic
-from langchain_community.embeddings import SentenceTransformerEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from dotenv import load_dotenv
 from pathlib import Path
 from pypdf import PdfReader
@@ -15,7 +15,7 @@ load_dotenv(BASE_DIR/".env")
 
 app = FastAPI()
 
-embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 vectorstore = Chroma(embedding_function=embeddings, persist_directory=f"{BASE_DIR}/chroma_db")
 llm = ChatAnthropic(model="claude-haiku-4-5-20251001")
 

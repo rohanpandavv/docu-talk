@@ -2,10 +2,9 @@ fastapi
 uvicorn
 python-multipart
 langchain
-langchain-community
 langchain-anthropic
 langchain-text-splitters
-chromadb
-sentence-transformers
+langchain-chroma
+langchain-openai
 python-dotenv
 pypdf
