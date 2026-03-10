@@ -179,11 +179,6 @@ streamlit run app.py
 | POST | `/upload` | `multipart/form-data` (file) | Upload a PDF or TXT file for indexing |
 | POST | `/chat` | `{"question": "..."}` | Ask a question about uploaded documents |
 
-## Planned Improvements
-- Prepare a strategy to evaluate the performance of the RAG system
-- Add logging
-- Handle multiple files in a better manner
-
 ## Project Structure
 
 ```
@@ -199,6 +194,12 @@ DocuTalk/
 ├── LICENSE
 └── README.md
 ```
+
+## Planned Improvements
+- Prepare a strategy to evaluate the performance of the RAG system
+- Add logging
+- Handle multiple files in a better manner
+
 
 ## License
 
