@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -13,6 +14,7 @@ class DocumentRegistry:
     def __init__(self, path: Path):
         self.path = path
         self._lock = Lock()
+        self.logger = logging.getLogger("docutalk.registry")
         self._ensure_file()
 
     def list_documents(self) -> dict[str, Any]:
@@ -109,14 +111,11 @@ class DocumentRegistry:
         return document, state["active_document_id"]
 
     def _ensure_file(self) -> None:
-        if self.path.exists():
+        if self.path.exists() and self.path.stat().st_size > 0:
             return
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(self._default_state(), indent=2),
-            encoding="utf-8",
-        )
+        self._write_state(self._default_state())
 
     def _default_state(self) -> dict[str, Any]:
         return {
@@ -128,10 +127,59 @@ class DocumentRegistry:
         if not self.path.exists():
             return self._default_state()
 
-        with self.path.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
+        raw_content = self.path.read_text(encoding="utf-8").strip()
+        if not raw_content:
+            self.logger.warning(
+                "Document registry at %s was empty. Resetting it to a clean default state.",
+                self.path,
+            )
+            return self._reset_state_file()
+
+        try:
+            state = json.loads(raw_content)
+        except json.JSONDecodeError:
+            self.logger.warning(
+                "Document registry at %s contained invalid JSON. Backing it up and resetting it.",
+                self.path,
+            )
+            self._backup_corrupt_state(raw_content)
+            return self._reset_state_file()
+
+        if not isinstance(state, dict):
+            self.logger.warning(
+                "Document registry at %s had an unexpected structure. Resetting it.",
+                self.path,
+            )
+            return self._reset_state_file()
+
+        active_document_id = state.get("active_document_id")
+        documents = state.get("documents")
+        if documents is None:
+            documents = {}
+
+        if not isinstance(documents, dict):
+            self.logger.warning(
+                "Document registry at %s had invalid documents data. Resetting it.",
+                self.path,
+            )
+            return self._reset_state_file()
+
+        return {
+            "active_document_id": active_document_id,
+            "documents": documents,
+        }
 
     def _write_state(self, state: dict[str, Any]) -> None:
         temp_path = self.path.with_suffix(".tmp")
         temp_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
         temp_path.replace(self.path)
+
+    def _reset_state_file(self) -> dict[str, Any]:
+        default_state = self._default_state()
+        self._write_state(default_state)
+        return default_state
+
+    def _backup_corrupt_state(self, raw_content: str) -> None:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        backup_path = self.path.with_name(f"{self.path.stem}.corrupt.{timestamp}.json")
+        backup_path.write_text(raw_content, encoding="utf-8")
