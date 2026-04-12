@@ -29,11 +29,27 @@ class ChatResponse(BaseModel):
     sources: list[SourceSnippet]
 
 
+class ChunkingStrategyOption(BaseModel):
+    key: str
+    label: str
+    description: str
+    chunk_size: int
+    chunk_overlap: int
+
+
+class ChunkingStrategiesResponse(BaseModel):
+    default_strategy: str
+    strategies: list[ChunkingStrategyOption]
+
+
 class UploadResponse(BaseModel):
     message: str
     document_id: str
     filename: str
     chunk_count: int
+    chunking_strategy: str
+    chunk_size: int
+    chunk_overlap: int
 
 
 class DocumentSummary(BaseModel):
@@ -41,6 +57,9 @@ class DocumentSummary(BaseModel):
     filename: str
     content_type: str
     chunk_count: int
+    chunking_strategy: str | None = None
+    chunk_size: int | None = None
+    chunk_overlap: int | None = None
     created_at: datetime
     is_active: bool = False
 

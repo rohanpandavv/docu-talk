@@ -1,4 +1,4 @@
-from fastapi import Depends, FastAPI, File, UploadFile
+from fastapi import Depends, FastAPI, File, Form, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
@@ -7,6 +7,7 @@ from logging_config import configure_logging
 from schemas import (
     ChatRequest,
     ChatResponse,
+    ChunkingStrategiesResponse,
     DocumentDeleteResponse,
     DocumentListResponse,
     DocumentSummary,
@@ -45,6 +46,10 @@ def create_app() -> FastAPI:
     def list_documents(rag_service: RagService = Depends(get_rag_service)):
         return rag_service.list_documents()
 
+    @app.get("/chunking-strategies", response_model=ChunkingStrategiesResponse)
+    def list_chunking_strategies(rag_service: RagService = Depends(get_rag_service)):
+        return rag_service.list_chunking_strategies()
+
     @app.post("/documents/{document_id}/activate", response_model=DocumentSummary)
     def activate_document(document_id: str, rag_service: RagService = Depends(get_rag_service)):
         return rag_service.activate_document(document_id)
@@ -56,6 +61,7 @@ def create_app() -> FastAPI:
     @app.post("/upload", response_model=UploadResponse)
     async def upload_document(
         file: UploadFile = File(...),
+        chunking_strategy: str | None = Form(None),
         rag_service: RagService = Depends(get_rag_service),
     ):
         content = await file.read()
@@ -64,6 +70,7 @@ def create_app() -> FastAPI:
             file.filename,
             file.content_type,
             content,
+            chunking_strategy,
         )
 
     @app.post("/chat", response_model=ChatResponse)

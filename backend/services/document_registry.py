@@ -52,12 +52,18 @@ class DocumentRegistry:
         filename: str,
         content_type: str,
         chunk_count: int,
+        chunking_strategy: str,
+        chunk_size: int,
+        chunk_overlap: int,
     ) -> dict[str, Any]:
         document = {
             "document_id": document_id,
             "filename": filename,
             "content_type": content_type,
             "chunk_count": chunk_count,
+            "chunking_strategy": chunking_strategy,
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 

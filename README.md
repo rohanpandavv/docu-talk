@@ -1,6 +1,6 @@
 # DocuTalk
 
-DocuTalk lets you have a conversation with your documents. Upload a PDF or text file, index it, and ask grounded questions against the selected document.
+DocuTalk lets you have a conversation with your documents. Upload a PDF or text file, choose a chunking strategy, index it, and ask grounded questions against the selected document.
 
 It works using **Retrieval-Augmented Generation (RAG)**: instead of asking an LLM to rely on its training data alone (which can lead to hallucinations), we feed it the exact excerpts from your document that are relevant to your question. The LLM's job is reduced from "know everything" to "read and summarize what's in front of it," which is generally more reliable.
 
@@ -44,10 +44,11 @@ flowchart LR
 
 **Indexing (upload):**
 1. User uploads a PDF/TXT via the Streamlit frontend
-2. FastAPI extracts text (using `pypdf` for PDFs)
-3. Text is split into 1000-character chunks with 200-character overlap using LangChain's `RecursiveCharacterTextSplitter`
-4. Each chunk is embedded via OpenAI's `text-embedding-3-small` and stored in ChromaDB with document-scoped metadata
-5. The uploaded document is registered as the active document for future chat requests
+2. User selects a chunking preset based on the document type
+3. FastAPI extracts text (using `pypdf` for PDFs)
+4. Text is split with a preset chunk size / overlap strategy using LangChain's `RecursiveCharacterTextSplitter`
+5. Each chunk is embedded via OpenAI's `text-embedding-3-small` and stored in ChromaDB with document-scoped metadata
+6. The uploaded document is registered as the active document for future chat requests
 
 **Querying (chat):**
 1. User asks a question against either an explicit `document_id` or the active document
@@ -110,6 +111,16 @@ Originally, the project used `sentence-transformers` to run the `all-MiniLM-L6-v
 - `RecursiveCharacterTextSplitter` tries to split on paragraph or sentence boundaries before falling back to characters, which helps preserve semantic coherence
 
 **Tradeoff:** Fixed chunk sizes don't adapt to document structure. Semantic chunking or document-aware splitting, such as splitting by section headers, could improve retrieval quality but would add complexity.
+
+### Why preset-based chunking instead of one static strategy?
+
+Research papers, reports, and transcripts often behave differently during retrieval, so the upload flow now lets the user choose among a few curated chunking presets.
+
+- `Research Paper`: keeps the original balanced default for structured academic PDFs
+- `Article / Report`: uses larger chunks for smoother prose and long-form sections
+- `Notes / Transcript`: uses smaller chunks for rapid topic shifts, bullets, and conversational text
+
+**Tradeoff:** This is more flexible than a single global strategy, but still simpler and safer than exposing raw chunk-size tuning to every user.
 
 ### Why FastAPI + Streamlit instead of a single app?
 
@@ -208,13 +219,31 @@ streamlit run app.py
 
 | Method | Endpoint | Body | Description |
 |--------|----------|------|-------------|
-| POST | `/upload` | `multipart/form-data` (file) | Upload a PDF or TXT file for indexing |
+| GET | `/chunking-strategies` | - | List the available chunking presets and the default strategy |
+| POST | `/upload` | `multipart/form-data` (`file`, optional `chunking_strategy`) | Upload a PDF or TXT file for indexing |
 | GET | `/documents` | - | List indexed documents and the current active document |
 | POST | `/documents/{document_id}/activate` | - | Mark a document as the default target for chat requests |
 | DELETE | `/documents/{document_id}` | - | Remove a document and its embeddings |
 | POST | `/chat` | `{"question": "...", "document_id": "optional"}` | Ask a question about the active document or an explicit document id |
 
 ### Example responses
+
+`GET /chunking-strategies`
+
+```json
+{
+  "default_strategy": "research_paper",
+  "strategies": [
+    {
+      "key": "research_paper",
+      "label": "Research Paper",
+      "description": "Balanced chunks for sectioned academic writing, citations, and method-heavy PDFs.",
+      "chunk_size": 1000,
+      "chunk_overlap": 200
+    }
+  ]
+}
+```
 
 `POST /upload`
 
@@ -223,7 +252,10 @@ streamlit run app.py
   "message": "Document indexed successfully!",
   "document_id": "2f2f1e74-3d8d-4c2e-b7eb-4b986c9f4201",
   "filename": "paper.pdf",
-  "chunk_count": 12
+  "chunk_count": 12,
+  "chunking_strategy": "research_paper",
+  "chunk_size": 1000,
+  "chunk_overlap": 200
 }
 ```
 
@@ -249,6 +281,7 @@ streamlit run app.py
 - Refactored the backend from a single-file prototype into smaller config, schema, and service modules
 - Added a persistent document registry so uploads can be listed, activated, and deleted cleanly
 - Scoped retrieval to a single document to avoid mixing chunks from different uploads
+- Added selectable chunking presets so indexing can be tuned by document type without exposing raw chunk parameters in the UI
 - Added stronger upload validation, clearer service errors, and source snippets in chat responses
 - Added request/provider timeouts and better logging so indexing failures surface instead of hanging silently
 
@@ -262,11 +295,13 @@ DocuTalk/
 │   ├── logging_config.py    # Logging setup
 │   ├── schemas.py           # Request/response models
 │   ├── services/
+│   │   ├── chunking.py           # Chunking strategy presets and splitter helpers
 │   │   ├── document_registry.py  # Persistent metadata for indexed docs
 │   │   ├── errors.py             # Service-layer exceptions
 │   │   └── rag.py                # Ingestion, retrieval, and answer generation
 │   ├── tests/
 │   │   ├── test_api.py           # API-level tests with service overrides
+│   │   ├── test_chunking.py      # Chunking preset tests
 │   │   └── test_registry.py      # Registry behavior tests
 │   ├── requirements.txt
 │   └── .env                 # API keys, chunking, logging, and timeout settings
@@ -283,6 +318,7 @@ DocuTalk/
 - Add score thresholds / better "answer not found in the document" handling
 - Support OCR or another fallback path for scanned PDFs
 - Improve multi-document workflows beyond the current active-document model
+- Move from preset chunking toward structure-aware or semantic chunking for higher retrieval quality
 
 
 ## License

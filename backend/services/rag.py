@@ -12,18 +12,23 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import OpenAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 
 from config import Settings, get_settings
 from schemas import (
     ChatRequest,
     ChatResponse,
+    ChunkingStrategiesResponse,
     DocumentDeleteResponse,
     DocumentListResponse,
     DocumentSummary,
     SourceSnippet,
     UploadResponse,
+)
+from services.chunking import (
+    build_text_splitter,
+    list_chunking_strategies,
+    resolve_chunking_strategy,
 )
 from services.document_registry import DocumentRegistry
 from services.errors import (
@@ -51,10 +56,6 @@ class RagService:
         self.settings = settings
         self.logger = logging.getLogger("docutalk.rag")
         self.registry = DocumentRegistry(settings.documents_registry_path)
-        self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=settings.chunk_size,
-            chunk_overlap=settings.chunk_overlap,
-        )
         self.prompt = PromptTemplate.from_template(PROMPT_TEMPLATE)
         self._vectorstore: Chroma | None = None
         self._llm: ChatAnthropic | None = None
@@ -64,18 +65,21 @@ class RagService:
         filename: str | None,
         content_type: str | None,
         content: bytes,
+        chunking_strategy_key: str | None = None,
     ) -> UploadResponse:
         safe_filename = (filename or "document").strip() or "document"
         normalized_content_type = (content_type or "").lower()
         resolved_content_type = normalized_content_type or self._content_type_from_filename(
             safe_filename
         )
+        strategy = resolve_chunking_strategy(self.settings, chunking_strategy_key)
 
         self.logger.info(
-            "Starting document ingest for %s (%s bytes, content_type=%s)",
+            "Starting document ingest for %s (%s bytes, content_type=%s, strategy=%s)",
             safe_filename,
             len(content),
             resolved_content_type,
+            strategy.key,
         )
 
         if not content:
@@ -97,13 +101,17 @@ class RagService:
             safe_filename,
         )
 
-        chunked_documents = self.splitter.split_documents(source_documents)
+        splitter = build_text_splitter(strategy)
+        chunked_documents = splitter.split_documents(source_documents)
         if not chunked_documents:
             raise DocumentProcessingError("The uploaded document did not produce any chunks.")
         self.logger.info(
-            "Prepared %s chunk(s) for %s; starting embedding/indexing",
+            "Prepared %s chunk(s) for %s using %s (%s/%s); starting embedding/indexing",
             len(chunked_documents),
             safe_filename,
+            strategy.key,
+            strategy.chunk_size,
+            strategy.chunk_overlap,
         )
 
         document_id = str(uuid4())
@@ -119,6 +127,7 @@ class RagService:
                     "source": safe_filename,
                     "content_type": resolved_content_type,
                     "chunk_index": index,
+                    "chunking_strategy": strategy.key,
                 }
             )
             texts.append(chunk.page_content)
@@ -132,6 +141,9 @@ class RagService:
                 filename=safe_filename,
                 content_type=resolved_content_type,
                 chunk_count=len(texts),
+                chunking_strategy=strategy.key,
+                chunk_size=strategy.chunk_size,
+                chunk_overlap=strategy.chunk_overlap,
             )
         except ConfigurationError:
             raise
@@ -156,6 +168,9 @@ class RagService:
             document_id=document_id,
             filename=safe_filename,
             chunk_count=len(texts),
+            chunking_strategy=strategy.key,
+            chunk_size=strategy.chunk_size,
+            chunk_overlap=strategy.chunk_overlap,
         )
 
     def chat(self, request: ChatRequest) -> ChatResponse:
@@ -214,6 +229,9 @@ class RagService:
 
     def list_documents(self) -> DocumentListResponse:
         return DocumentListResponse(**self.registry.list_documents())
+
+    def list_chunking_strategies(self) -> ChunkingStrategiesResponse:
+        return list_chunking_strategies(self.settings)
 
     def activate_document(self, document_id: str) -> DocumentSummary:
         return DocumentSummary(**self.registry.activate_document(document_id))
