@@ -1,59 +1,76 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from pydantic import BaseModel
-from langchain_chroma import Chroma
-from langchain_anthropic import ChatAnthropic
-from langchain_openai import OpenAIEmbeddings
-from dotenv import load_dotenv
-from pathlib import Path
-from pypdf import PdfReader
-from io import BytesIO
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.prompts import PromptTemplate
+from fastapi import Depends, FastAPI, File, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
 
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR/".env")
+from config import get_settings
+from logging_config import configure_logging
+from schemas import (
+    ChatRequest,
+    ChatResponse,
+    DocumentDeleteResponse,
+    DocumentListResponse,
+    DocumentSummary,
+    UploadResponse,
+)
+from services.errors import (
+    ConfigurationError,
+    DocumentNotFoundError,
+    DocumentProcessingError,
+    NoActiveDocumentError,
+    ServiceError,
+    UpstreamServiceError,
+)
+from services.rag import RagService, get_rag_service
 
-app = FastAPI()
 
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-vectorstore = Chroma(embedding_function=embeddings, persist_directory=f"{BASE_DIR}/chroma_db")
-llm = ChatAnthropic(model="claude-haiku-4-5-20251001")
+def create_app() -> FastAPI:
+    settings = get_settings()
+    configure_logging(settings.log_level)
 
-class ChatRequest(BaseModel):
-    question: str
+    app = FastAPI(title=settings.app_name)
 
-@app.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
-    content = await file.read()
-    print("content_type ----> ", file.content_type)
-    content_type = file.content_type.lower()
-    if content_type == "application/pdf":
-        pdf =  PdfReader(BytesIO(content))
-        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-    elif content_type == "text/plain":
-        try:
-            text = content.decode("utf-8")
-        except UnicodeDecodeError:
-            raise HTTPException(status_code=400, detail="Text file is not valid UTF-8")
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported file type.")
-    
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    chunks = splitter.split_text(text)
-    
-    vectorstore.add_texts(texts=chunks)
-    return {"message": "Document indexed successfully!"}
+    @app.exception_handler(ServiceError)
+    async def service_error_handler(_, exc: ServiceError):
+        if isinstance(exc, DocumentNotFoundError):
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        if isinstance(exc, (DocumentProcessingError, NoActiveDocumentError)):
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+        if isinstance(exc, UpstreamServiceError):
+            return JSONResponse(status_code=502, content={"detail": str(exc)})
+        if isinstance(exc, ConfigurationError):
+            return JSONResponse(status_code=500, content={"detail": str(exc)})
+        return JSONResponse(status_code=500, content={"detail": "Unexpected service failure."})
 
-@app.post("/chat")
-async def chat(request: ChatRequest):
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-    docs = retriever.invoke(request.question)
-    context = "\n".join([doc.page_content for doc in docs])
-    
-    template = "Answer the following question based on this context. Context: {context} Question: {question}"
-    prompt = PromptTemplate.from_template(template)
-    
-    chain = prompt | llm
-    answer = chain.invoke({"context": context, "question": request.question})
-    
-    return {"answer": answer.content}
+    @app.get("/documents", response_model=DocumentListResponse)
+    def list_documents(rag_service: RagService = Depends(get_rag_service)):
+        return rag_service.list_documents()
+
+    @app.post("/documents/{document_id}/activate", response_model=DocumentSummary)
+    def activate_document(document_id: str, rag_service: RagService = Depends(get_rag_service)):
+        return rag_service.activate_document(document_id)
+
+    @app.delete("/documents/{document_id}", response_model=DocumentDeleteResponse)
+    def delete_document(document_id: str, rag_service: RagService = Depends(get_rag_service)):
+        return rag_service.delete_document(document_id)
+
+    @app.post("/upload", response_model=UploadResponse)
+    async def upload_document(
+        file: UploadFile = File(...),
+        rag_service: RagService = Depends(get_rag_service),
+    ):
+        content = await file.read()
+        return await run_in_threadpool(
+            rag_service.ingest_document,
+            file.filename,
+            file.content_type,
+            content,
+        )
+
+    @app.post("/chat", response_model=ChatResponse)
+    def chat(request: ChatRequest, rag_service: RagService = Depends(get_rag_service)):
+        return rag_service.chat(request)
+
+    return app
+
+
+app = create_app()

@@ -144,6 +144,7 @@ ENV/
 env.bak/
 venv.bak/
 chroma_db
+backend/data/documents.json
 
 # Spyder project settings
 .spyderproject
