@@ -15,16 +15,23 @@ from ragas import EvaluationDataset, evaluate
 from ragas.dataset_schema import SingleTurnSample
 from ragas.embeddings.base import embedding_factory
 from ragas.llms import llm_factory
-from ragas.metrics.collections import (
-    AnswerCorrectness,
-    AnswerRelevancy,
-    ContextPrecisionWithReference,
-    ContextRecall,
-    Faithfulness,
-)
+# RAGAS 0.4.x still validates metrics against the legacy Metric base class in evaluate(),
+# so use the compatible implementations from the private legacy modules here.
+from ragas.metrics._answer_correctness import AnswerCorrectness
+from ragas.metrics._answer_relevance import AnswerRelevancy
+from ragas.metrics._context_precision import LLMContextPrecisionWithReference
+from ragas.metrics._context_recall import ContextRecall
+from ragas.metrics._faithfulness import Faithfulness
 from ragas.run_config import RunConfig
 
 from config import BASE_DIR, Settings, get_settings
+from evals.baseline import (
+    build_baseline_snapshot,
+    compare_aggregate_scores,
+    load_baseline_snapshot,
+    resolve_baseline_path,
+    save_baseline_snapshot,
+)
 from evals.dataset import load_eval_dataset, resolve_document_path
 from logging_config import configure_logging
 from schemas import ChatRequest
@@ -89,6 +96,19 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="Maximum worker count used by RAGAS.",
     )
+    parser.add_argument(
+        "--baseline",
+        default=None,
+        help=(
+            "Optional baseline snapshot JSON to compare against. "
+            "If omitted, evals/baselines/<dataset_stem>.json is used when present."
+        ),
+    )
+    parser.add_argument(
+        "--save-baseline",
+        action="store_true",
+        help="Write the current run's aggregate scores as the baseline snapshot.",
+    )
     return parser.parse_args()
 
 
@@ -113,7 +133,18 @@ def create_ragas_llm(settings: Settings, provider: str, model: str | None):
         if not settings.anthropic_api_key:
             raise ValueError("ANTHROPIC_API_KEY is required for Anthropic-based RAGAS evaluation.")
         client = AsyncAnthropic(api_key=settings.anthropic_api_key)
-        return llm_factory(judge_model, provider="anthropic", client=client)
+        # RAGAS 0.4.x defaults to both temperature and top_p for Anthropic, but
+        # current Claude models reject requests that set both together.
+        llm = llm_factory(
+            judge_model,
+            provider="anthropic",
+            client=client,
+            temperature=0.01,
+            max_tokens=1024,
+            top_p=None,
+        )
+        llm.model_args.pop("top_p", None)
+        return llm
 
     if not settings.openai_api_key:
         raise ValueError("OPENAI_API_KEY is required for OpenAI-based RAGAS evaluation.")
@@ -125,11 +156,13 @@ def create_ragas_embeddings(settings: Settings):
     if not settings.openai_api_key:
         raise ValueError("OPENAI_API_KEY is required for RAGAS embedding-based metrics.")
 
-    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    # RAGAS 0.4.x legacy metrics still expect the old LangChain-style embedding
+    # interface with embed_query()/embed_documents(), so we intentionally use the
+    # legacy factory mode here instead of the modern provider wrapper.
     return embedding_factory(
-        "openai",
         settings.embedding_model,
-        client=client,
+        run_config=RunConfig(timeout=settings.openai_timeout_seconds),
+        interface="legacy",
     )
 
 
@@ -138,7 +171,10 @@ def build_metrics(metric_names: list[str], llm, embeddings):
         "faithfulness": lambda: Faithfulness(llm=llm),
         "answer_relevancy": lambda: AnswerRelevancy(llm=llm, embeddings=embeddings),
         "context_recall": lambda: ContextRecall(llm=llm),
-        "context_precision_with_reference": lambda: ContextPrecisionWithReference(llm=llm),
+        "context_precision_with_reference": lambda: LLMContextPrecisionWithReference(
+            llm=llm,
+            name="context_precision_with_reference",
+        ),
         "answer_correctness": lambda: AnswerCorrectness(llm=llm, embeddings=embeddings),
     }
 
@@ -195,14 +231,76 @@ def prepare_evaluation_records(service: RagService, dataset_path: Path):
     return records
 
 
+def compute_aggregate_scores(report_df, selected_metrics: list[str]) -> dict[str, float]:
+    aggregate_scores: dict[str, float] = {}
+    for metric in selected_metrics:
+        if metric in report_df.columns:
+            aggregate_scores[metric] = float(report_df[metric].mean())
+    return aggregate_scores
+
+
+def build_baseline_comparison(
+    *,
+    baseline_path: Path | None,
+    selected_metrics: list[str],
+    aggregate_scores: dict[str, float],
+) -> dict[str, object] | None:
+    if baseline_path is None:
+        return None
+
+    if not baseline_path.exists():
+        LOGGER.info("No baseline snapshot found at %s; skipping comparison.", baseline_path)
+        return None
+
+    baseline_payload = load_baseline_snapshot(baseline_path)
+    baseline_scores = baseline_payload.get("aggregate_scores", {})
+    if not isinstance(baseline_scores, dict):
+        raise ValueError(
+            f"Baseline snapshot '{baseline_path}' is missing a valid aggregate_scores object."
+        )
+
+    metric_deltas = compare_aggregate_scores(
+        current_scores=aggregate_scores,
+        baseline_scores=baseline_scores,
+        metrics=selected_metrics,
+    )
+    matched_metrics = [item for item in metric_deltas if item["baseline"] is not None]
+    missing_metrics = [item["metric"] for item in metric_deltas if item["baseline"] is None]
+
+    LOGGER.info("Baseline comparison against %s", baseline_path)
+    for item in matched_metrics:
+        LOGGER.info(
+            "Metric %s: current=%.4f baseline=%.4f delta=%+.4f",
+            item["metric"],
+            item["current"],
+            item["baseline"],
+            item["delta"],
+        )
+    if missing_metrics:
+        LOGGER.info(
+            "Baseline snapshot is missing aggregate scores for: %s",
+            ", ".join(missing_metrics),
+        )
+
+    return {
+        "baseline_path": str(baseline_path),
+        "baseline_generated_at": baseline_payload.get("generated_at"),
+        "baseline_judge_provider": baseline_payload.get("judge_provider"),
+        "baseline_judge_model": baseline_payload.get("judge_model"),
+        "metrics": metric_deltas,
+    }
+
+
 def save_reports(
     *,
     report_dir: Path,
     dataset_path: Path,
     report_df,
+    aggregate_scores: dict[str, float],
     selected_metrics: list[str],
     judge_provider: str,
     judge_model: str,
+    baseline_comparison: dict[str, object] | None = None,
 ) -> tuple[Path, Path]:
     report_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -211,11 +309,6 @@ def save_reports(
     json_path = report_dir / f"{report_stem}.json"
 
     report_df.to_csv(csv_path, index=False)
-
-    aggregate_scores = {}
-    for metric in selected_metrics:
-        if metric in report_df.columns:
-            aggregate_scores[metric] = float(report_df[metric].mean())
 
     payload = {
         "dataset_path": str(dataset_path),
@@ -226,6 +319,8 @@ def save_reports(
         "aggregate_scores": aggregate_scores,
         "samples": report_df.to_dict(orient="records"),
     }
+    if baseline_comparison is not None:
+        payload["baseline_comparison"] = baseline_comparison
     json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     return csv_path, json_path
@@ -240,6 +335,14 @@ def main() -> None:
     report_dir = Path(args.report_dir)
     if not report_dir.is_absolute():
         report_dir = (BASE_DIR / report_dir).resolve()
+    baseline_path = resolve_baseline_path(
+        base_dir=BASE_DIR,
+        dataset_path=dataset_path,
+        baseline_arg=args.baseline,
+        create_default=args.save_baseline,
+    )
+    if args.baseline and baseline_path is not None and not baseline_path.exists() and not args.save_baseline:
+        raise FileNotFoundError(f"Baseline snapshot '{baseline_path}' does not exist.")
 
     selected_metrics = [
         metric_name.strip()
@@ -292,15 +395,34 @@ def main() -> None:
     report_df.insert(1, "document_path", [record["document_path"] for record in records])
     report_df.insert(2, "chunking_strategy", [record["chunking_strategy"] for record in records])
     report_df.insert(3, "retrieved_chunk_count", [record["retrieved_chunk_count"] for record in records])
+    aggregate_scores = compute_aggregate_scores(report_df, selected_metrics)
+    baseline_comparison = build_baseline_comparison(
+        baseline_path=baseline_path,
+        selected_metrics=selected_metrics,
+        aggregate_scores=aggregate_scores,
+    )
 
     csv_path, json_path = save_reports(
         report_dir=report_dir,
         dataset_path=dataset_path,
         report_df=report_df,
+        aggregate_scores=aggregate_scores,
         selected_metrics=selected_metrics,
         judge_provider=args.judge_provider,
         judge_model=judge_model,
+        baseline_comparison=baseline_comparison,
     )
+    if args.save_baseline and baseline_path is not None:
+        baseline_snapshot = build_baseline_snapshot(
+            dataset_path=dataset_path,
+            judge_provider=args.judge_provider,
+            judge_model=judge_model,
+            metrics=selected_metrics,
+            aggregate_scores=aggregate_scores,
+            sample_count=len(records),
+        )
+        save_baseline_snapshot(baseline_path, baseline_snapshot)
+        LOGGER.info("Saved baseline snapshot to %s", baseline_path)
 
     LOGGER.info("Saved RAGAS CSV report to %s", csv_path)
     LOGGER.info("Saved RAGAS JSON report to %s", json_path)

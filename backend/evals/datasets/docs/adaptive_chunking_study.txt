@@ -1,0 +1,13 @@
+Title: Adaptive Chunking for Public Sector Knowledge Assistants
+
+Abstract
+This internal study evaluated whether adaptive chunk boundaries improve grounded question answering for long public sector documents. The team compared DocuTalk's fixed-length baseline against a section-aware chunking recipe that preserved headings, kept table captions with nearby paragraphs, and retained short citation spans that explained where a claim came from. Across 312 benchmark questions, answer correctness improved from 0.61 to 0.74 and the observed hallucination rate dropped from 14 percent to 6 percent. The largest gains appeared on questions that asked about methods, eligibility rules, and budget exceptions.
+
+Dataset and Method
+Researchers assembled 48 English-language grant guides, procurement memos, and policy briefs from one municipal innovation office. Each source document was converted to text, normalized, and indexed with the same embedding model used in production. The baseline configuration used 800 character chunks with 120 characters of overlap. The adaptive configuration first split on major headings, then applied recursive sub-splitting only when a section exceeded the target window. This meant short sections such as Definitions or Timeline stayed intact while dense sections such as Evaluation Criteria were broken into smaller pieces. The team also kept footnote markers and one sentence of citation context because reviewers often asked where a requirement originated.
+
+Results
+Adaptive chunking improved retrieval recall most for budget justification questions and for prompts asking which attachments were mandatory. Median answer latency increased from 1.8 seconds to 2.1 seconds because more metadata had to be preserved during indexing and prompt assembly. The approach helped the least on short compliance forms where the baseline already returned the entire relevant passage in a single chunk. Reviewers reported that answers were easier to trust when the retrieved snippets included headings such as Allowable Costs or Submission Checklist.
+
+Limitations and Next Steps
+The study only covered documents from one municipality, so the authors cautioned against assuming the same gains would appear in private sector handbooks or multilingual archives. They also noted that OCR noise in scanned appendices still caused retrieval misses even with better chunk boundaries. A follow-up experiment was proposed to test multilingual documents and to compare adaptive chunking with lightweight reranking.

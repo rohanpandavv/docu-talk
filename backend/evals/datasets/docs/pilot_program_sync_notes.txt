@@ -1,0 +1,21 @@
+DocuTalk Pilot Program Weekly Sync Notes
+Date: April 11
+Attendees: Maya Chen, Elena Ruiz, Rohan Pandav, Samir Patel, Nina Lopez
+
+Status Roundup
+Maya said the customer success team finished the first draft of the onboarding checklist and wants legal-approved language before the checklist is sent externally. Elena reported that procurement is still waiting on the vendor security questionnaire, which blocks the final purchasing packet. Samir confirmed that the analytics event names are stable and the dashboard can be wired as soon as the sandbox environment is available.
+
+Decisions
+The group agreed to keep the upload limit at 10 MB for the pilot rather than raising it immediately. They also agreed that transcript-heavy customer interview notes should use the notes_transcript chunking preset during internal testing, while PDF briefs and proposals should stay on the research_paper preset unless a reviewer sees retrieval gaps.
+
+Risks and Blockers
+Finance has not released the training budget because legal has not approved the draft data processing addendum yet. The pilot launch target remains May 6, but that date depends on the SSO sandbox being ready by April 29 so customer admins can validate login flows one week before kickoff. Nina flagged that help center screenshots still show the old sidebar and need to be refreshed before enablement sessions begin.
+
+Action Items
+Maya will send the vendor security questionnaire to procurement by April 18.
+Elena will confirm whether the French localization vendor can still meet the screenshot deadline by next Tuesday.
+Rohan will trim the onboarding deck from 18 slides to 12 slides and circulate the shorter version before the next sync.
+Samir will add an activation metric for teams that finish setup within two business days.
+
+Open Questions
+The team still needs to decide whether pilot customers should see citations by default in the chat UI. They also want a recommendation on whether billing articles should be consolidated before the pilot or immediately after launch.

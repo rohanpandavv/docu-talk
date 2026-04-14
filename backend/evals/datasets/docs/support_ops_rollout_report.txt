@@ -1,0 +1,16 @@
+DocuTalk Support Operations Rollout Report
+
+Executive Summary
+During the first six weeks of the support knowledge rollout, agents handled a higher volume of document-guided conversations without increasing overall handle time. Search success for the new knowledge workspace rose from 58 percent to 74 percent in the Phoenix and Denver pilot groups. Even with the improvement, repeat contacts remained concentrated in refund, account recovery, and identity verification workflows where the underlying reference content was fragmented across near-duplicate articles.
+
+Operational Findings
+The clearest driver of repeat contacts was article duplication in the refund flow. Seventeen articles described slightly different refund exceptions, and agents often opened two or three versions before responding. A second source of friction came from an outdated password-reset macro that still referenced a retired verification screen. Weekend performance was stable, but only because two senior specialists manually triaged the queue whenever unresolved billing cases spiked.
+
+Customer Experience Signals
+Escalations dropped fastest in Phoenix, where supervisors required every shift lead to archive superseded articles at the end of the day. Denver improved more slowly because legal review delayed the macro rewrite by nine days. Montreal was scheduled as the next launch market, but the translation vendor had not yet delivered the final French screenshots and glossary updates. Program managers estimated that if those localized assets slipped again, the Montreal rollout would move back by roughly three weeks.
+
+Recommendations
+The report recommends consolidating the 17 refund articles into three canonical playbooks with clear exception tables. It also recommends keeping weekend staffing at two specialists until the self-serve returns flow ships broadly, rather than reducing coverage immediately after launch. Finally, the authors propose a six-week macro cleanup that pairs support operations with legal so policy text and screenshots are updated together instead of in separate handoffs.
+
+Measurement Plan
+Success for the next phase will be measured through search success, repeat contact rate, and the share of billing escalations resolved without supervisor intervention. Leadership asked for a follow-up review two weeks after the Montreal decision is finalized.
