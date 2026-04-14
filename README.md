@@ -314,7 +314,7 @@ DocuTalk/
 ```
 
 ## Planned Improvements
-- Prepare a strategy to evaluate the performance of the RAG system
+- Expand the offline benchmark with negative / abstention cases
 - Add score thresholds / better "answer not found in the document" handling
 - Support OCR or another fallback path for scanned PDFs
 - Improve multi-document workflows beyond the current active-document model
@@ -325,6 +325,46 @@ DocuTalk/
 An offline RAGAS-based evaluator is now scaffolded under `backend/evals/README.md`.
 
 Use it to benchmark retrieval and answer quality on a fixed set of documents and questions instead of trying to evaluate arbitrary user uploads live.
+
+The repo now includes a first curated benchmark at `backend/evals/datasets/docutalk_benchmark_v1.jsonl`, backed by deterministic text fixtures for all three chunking presets.
+
+### Initial Benchmark Snapshot
+
+The first full benchmark run on April 15, 2026 used:
+
+- the curated `docutalk_benchmark_v1` dataset
+- Anthropic `claude-haiku-4-5-20251001` as the RAGAS judge
+- the real DocuTalk ingestion, chunking, retrieval, and answer-generation pipeline
+
+Headline scores from that run:
+
+| Metric | Score | What it means |
+|--------|-------|---------------|
+| Faithfulness | `0.8905` | The answer usually stays grounded in the retrieved context. |
+| Answer Relevancy | `0.8782` | The answer usually addresses the question that was asked. |
+| Context Recall | `0.9333` | Retrieval usually brings back enough of the document to answer correctly. |
+| Context Precision (with reference) | `0.9222` | Retrieved chunks are usually relevant instead of noisy. |
+
+`answer_correctness` is still being treated as a work-in-progress metric for this project, so it is left out of the headline benchmark summary for now even though it is still emitted in the raw JSON/CSV reports.
+
+### RAGAS Metric Summary
+
+- `faithfulness`: checks whether the generated answer is actually supported by the retrieved chunks
+- `answer_relevancy`: checks whether the answer is responding to the user question rather than drifting
+- `context_recall`: checks whether retrieval brought back enough of the relevant information
+- `context_precision_with_reference`: checks whether the retrieved chunks were useful and not mostly noise
+
+### Findings
+
+- Retrieval quality looks strong overall. Both context-oriented metrics landed above `0.92`, which is a good sign that the current chunking + Chroma retrieval path is usually fetching the right evidence.
+- Grounding is also in a healthy range. A faithfulness score near `0.89` suggests the model is usually staying within the retrieved document rather than inventing unsupported claims.
+- Chunking choice already shows measurable impact on benchmark rows. For example, `research_paper` outperformed `general_article` on the duplicated Montreal rollout question, and `notes_transcript` outperformed `general_article` on the transcript-heavy meeting-notes question.
+- Single-row RAGAS scores can still be noisy, so the benchmark should be used mainly for trend comparison and regression detection rather than treating every individual row score as ground truth.
+
+### Notes On Benchmark Warnings
+
+- Transient Anthropic retry logs were observed during scoring. The run still completed successfully, so those retries are acceptable, but they do add latency and some variance.
+- RAGAS also occasionally logged that it received 1 generation instead of the requested 3 for a prompt. That is not fatal, but it can make some metric values less stable between runs.
 
 
 ## License
