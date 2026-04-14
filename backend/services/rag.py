@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 from functools import lru_cache
 from io import BytesIO
@@ -49,6 +50,13 @@ Context:
 Question:
 {question}
 """
+
+
+@dataclass(frozen=True, slots=True)
+class RagQueryResult:
+    answer: str
+    document_id: str
+    retrieved_documents: list[Document]
 
 
 class RagService:
@@ -174,58 +182,31 @@ class RagService:
         )
 
     def chat(self, request: ChatRequest) -> ChatResponse:
-        document_id = request.document_id or self.registry.get_active_document_id()
-        if not document_id:
-            raise NoActiveDocumentError(
-                "No active document found. Upload a document or provide document_id in the chat request."
-            )
+        result = self.answer_with_context(request)
+        sources = [self._build_source_snippet(doc) for doc in result.retrieved_documents]
 
-        document = self.registry.get_document(document_id)
-        if document is None:
-            raise DocumentNotFoundError(f"Document '{document_id}' was not found.")
+        return ChatResponse(
+            answer=result.answer,
+            document_id=result.document_id,
+            sources=sources,
+        )
 
-        self.logger.info("Starting retrieval for document %s", document_id)
-
-        try:
-            results = self._get_vectorstore().similarity_search(
-                request.question,
-                k=self.settings.retrieve_k,
-                filter={"document_id": document_id},
-            )
-        except ConfigurationError:
-            raise
-        except Exception as exc:
-            raise UpstreamServiceError("Failed to retrieve document context.") from exc
-
-        if not results:
-            raise DocumentProcessingError(
-                "No indexed chunks were found for the requested document."
-            )
-
-        context = "\n\n".join(doc.page_content for doc in results if doc.page_content.strip())
-        if not context:
-            raise DocumentProcessingError("The retrieved context was empty.")
-
-        try:
-            response = (self.prompt | self._get_llm()).invoke(
-                {"context": context, "question": request.question}
-            )
-        except ConfigurationError:
-            raise
-        except Exception as exc:
-            self.logger.exception("Failed to generate answer for document %s", document_id)
-            raise UpstreamServiceError("Failed to generate an answer from the indexed document.") from exc
-
-        answer = self._normalize_answer_content(response.content)
-        sources = [self._build_source_snippet(doc) for doc in results]
+    def answer_with_context(self, request: ChatRequest) -> RagQueryResult:
+        document_id = self._resolve_document_id(request.document_id)
+        results = self._retrieve_documents(request.question, document_id)
+        answer = self._generate_answer(request.question, document_id, results)
 
         self.logger.info(
             "Answered question against document %s using %s retrieved chunks",
             document_id,
-            len(sources),
+            len(results),
         )
 
-        return ChatResponse(answer=answer, document_id=document_id, sources=sources)
+        return RagQueryResult(
+            answer=answer,
+            document_id=document_id,
+            retrieved_documents=results,
+        )
 
     def list_documents(self) -> DocumentListResponse:
         return DocumentListResponse(**self.registry.list_documents())
@@ -259,6 +240,64 @@ class RagService:
             message="Document deleted successfully.",
             document_id=document_id,
         )
+
+    def _resolve_document_id(self, explicit_document_id: str | None) -> str:
+        document_id = explicit_document_id or self.registry.get_active_document_id()
+        if not document_id:
+            raise NoActiveDocumentError(
+                "No active document found. Upload a document or provide document_id in the chat request."
+            )
+
+        document = self.registry.get_document(document_id)
+        if document is None:
+            raise DocumentNotFoundError(f"Document '{document_id}' was not found.")
+
+        return document_id
+
+    def _retrieve_documents(self, question: str, document_id: str) -> list[Document]:
+        self.logger.info("Starting retrieval for document %s", document_id)
+
+        try:
+            results = self._get_vectorstore().similarity_search(
+                question,
+                k=self.settings.retrieve_k,
+                filter={"document_id": document_id},
+            )
+        except ConfigurationError:
+            raise
+        except Exception as exc:
+            raise UpstreamServiceError("Failed to retrieve document context.") from exc
+
+        if not results:
+            raise DocumentProcessingError(
+                "No indexed chunks were found for the requested document."
+            )
+
+        return results
+
+    def _generate_answer(
+        self,
+        question: str,
+        document_id: str,
+        retrieved_documents: list[Document],
+    ) -> str:
+        context = "\n\n".join(
+            doc.page_content for doc in retrieved_documents if doc.page_content.strip()
+        )
+        if not context:
+            raise DocumentProcessingError("The retrieved context was empty.")
+
+        try:
+            response = (self.prompt | self._get_llm()).invoke(
+                {"context": context, "question": question}
+            )
+        except ConfigurationError:
+            raise
+        except Exception as exc:
+            self.logger.exception("Failed to generate answer for document %s", document_id)
+            raise UpstreamServiceError("Failed to generate an answer from the indexed document.") from exc
+
+        return self._normalize_answer_content(response.content)
 
     def _extract_documents(
         self,

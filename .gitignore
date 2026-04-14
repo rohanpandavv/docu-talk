@@ -145,6 +145,9 @@ env.bak/
 venv.bak/
 chroma_db
 backend/data/documents.json
+backend/evals/reports/*.csv
+backend/evals/reports/*.json
+backend/evals/reports/*.parquet
 
 # Spyder project settings
 .spyderproject

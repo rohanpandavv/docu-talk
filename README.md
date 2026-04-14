@@ -320,6 +320,12 @@ DocuTalk/
 - Improve multi-document workflows beyond the current active-document model
 - Move from preset chunking toward structure-aware or semantic chunking for higher retrieval quality
 
+## Offline Evaluation
+
+An offline RAGAS-based evaluator is now scaffolded under `backend/evals/README.md`.
+
+Use it to benchmark retrieval and answer quality on a fixed set of documents and questions instead of trying to evaluate arbitrary user uploads live.
+
 
 ## License
 
