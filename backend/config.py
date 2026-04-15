@@ -53,6 +53,9 @@ class Settings:
     openai_timeout_seconds: int
     anthropic_timeout_seconds: int
     chroma_anonymized_telemetry: bool
+    cag_max_pages: int
+    cag_max_characters: int
+    anthropic_prompt_cache_ttl: str
 
     def __post_init__(self) -> None:
         if self.chunk_size <= 0:
@@ -69,6 +72,12 @@ class Settings:
             raise ValueError("OPENAI_TIMEOUT_SECONDS must be greater than 0.")
         if self.anthropic_timeout_seconds <= 0:
             raise ValueError("ANTHROPIC_TIMEOUT_SECONDS must be greater than 0.")
+        if self.cag_max_pages <= 0:
+            raise ValueError("CAG_MAX_PAGES must be greater than 0.")
+        if self.cag_max_characters <= 0:
+            raise ValueError("CAG_MAX_CHARACTERS must be greater than 0.")
+        if self.anthropic_prompt_cache_ttl not in {"5m", "1h"}:
+            raise ValueError("ANTHROPIC_PROMPT_CACHE_TTL must be one of: 5m, 1h.")
 
         self.chroma_directory.mkdir(parents=True, exist_ok=True)
         self.documents_registry_path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,4 +102,7 @@ def get_settings() -> Settings:
         openai_timeout_seconds=_read_int("OPENAI_TIMEOUT_SECONDS", 30),
         anthropic_timeout_seconds=_read_int("ANTHROPIC_TIMEOUT_SECONDS", 30),
         chroma_anonymized_telemetry=_read_bool("CHROMA_ANONYMIZED_TELEMETRY", False),
+        cag_max_pages=_read_int("CAG_MAX_PAGES", 12),
+        cag_max_characters=_read_int("CAG_MAX_CHARACTERS", 50000),
+        anthropic_prompt_cache_ttl=os.getenv("ANTHROPIC_PROMPT_CACHE_TTL", "5m"),
     )

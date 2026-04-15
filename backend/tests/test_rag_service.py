@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from langchain_core.documents import Document
 
@@ -15,6 +16,8 @@ class FakeVectorStore:
         self.add_calls = []
         self.search_calls = []
         self.search_results = {}
+        self.get_calls = []
+        self.get_results = {}
 
     def add_texts(self, texts, metadatas, ids):
         self.add_calls.append(
@@ -30,7 +33,11 @@ class FakeVectorStore:
         return self.search_results.get(self._normalize_filter(filter), [])
 
     def get(self, where, include):
-        return {"ids": []}
+        self.get_calls.append({"where": where, "include": include})
+        return self.get_results.get(
+            self._normalize_filter(where),
+            {"ids": [], "documents": [], "metadatas": []},
+        )
 
     def delete(self, ids):
         return None
@@ -56,6 +63,7 @@ class TestableRagService(RagService):
         super().__init__(settings)
         self._test_vectorstore = vectorstore
         self.generated_answers = []
+        self.cag_messages = []
 
     def _get_vectorstore(self):
         return self._test_vectorstore
@@ -69,6 +77,10 @@ class TestableRagService(RagService):
             }
         )
         return f"Answer using {len(retrieved_documents)} retrieved unit(s)"
+
+    def _invoke_cag_model(self, messages):
+        self.cag_messages.append(messages)
+        return SimpleNamespace(content="Answer using full-document context")
 
 
 class RagServiceTests(unittest.TestCase):
@@ -92,6 +104,9 @@ class RagServiceTests(unittest.TestCase):
             openai_timeout_seconds=30,
             anthropic_timeout_seconds=30,
             chroma_anonymized_telemetry=False,
+            cag_max_pages=12,
+            cag_max_characters=50000,
+            anthropic_prompt_cache_ttl="5m",
         )
         self.vectorstore = FakeVectorStore()
         self.service = TestableRagService(self.settings, self.vectorstore)
@@ -216,3 +231,130 @@ class RagServiceTests(unittest.TestCase):
             )
 
         self.assertIn("Re-upload it to build page indexes", str(context.exception))
+
+    def test_cag_mode_loads_page_context_in_order(self):
+        self.service.registry.add_document(
+            document_id="doc-cag",
+            filename="demo.txt",
+            content_type="text/plain",
+            page_count=2,
+            chunk_count=2,
+            chunking_strategy="research_paper",
+            chunk_size=1000,
+            chunk_overlap=200,
+        )
+        page_filter = (
+            "$and",
+            (
+                (("document_id", "doc-cag"),),
+                (("retrieval_unit", "page"),),
+            ),
+        )
+        self.vectorstore.get_results[page_filter] = {
+            "ids": ["doc-cag:page:2", "doc-cag:page:1"],
+            "documents": ["Second page context", "First page context"],
+            "metadatas": [
+                {"source": "demo.txt", "page": 2, "retrieval_unit": "page"},
+                {"source": "demo.txt", "page": 1, "retrieval_unit": "page"},
+            ],
+        }
+
+        response = self.service.chat(
+            ChatRequest(
+                question="What is this document about?",
+                document_id="doc-cag",
+                retrieval_mode="cag",
+            )
+        )
+
+        self.assertEqual(
+            self.vectorstore.get_calls[0]["where"],
+            {
+                "$and": [
+                    {"document_id": "doc-cag"},
+                    {"retrieval_unit": "page"},
+                ]
+            },
+        )
+        self.assertEqual(response.answer, "Answer using full-document context")
+        self.assertEqual([source.page for source in response.sources], [1, 2])
+        self.assertEqual([source.retrieval_unit for source in response.sources], ["cag", "cag"])
+        self.assertEqual(
+            self.cag_document_text(),
+            "Document context:\n[Page 1]\nFirst page context\n\n[Page 2]\nSecond page context",
+        )
+        self.assertEqual(
+            self.service.cag_messages[0][1].content[0]["cache_control"],
+            {"type": "ephemeral", "ttl": "5m"},
+        )
+
+    def test_cag_requires_page_indexes(self):
+        self.service.registry.add_document(
+            document_id="doc-legacy",
+            filename="legacy.txt",
+            content_type="text/plain",
+            page_count=1,
+            chunk_count=1,
+            chunking_strategy="research_paper",
+            chunk_size=1000,
+            chunk_overlap=200,
+        )
+
+        with self.assertRaises(DocumentProcessingError) as context:
+            self.service.answer_with_context(
+                ChatRequest(
+                    question="What does the legacy doc say?",
+                    document_id="doc-legacy",
+                    retrieval_mode="cag",
+                )
+            )
+
+        self.assertIn("Re-upload it to build page indexes", str(context.exception))
+
+    def test_cag_rejects_large_documents(self):
+        oversized_settings = Settings(
+            app_name="DocuTalk Test",
+            log_level="INFO",
+            openai_api_key="test-openai-key",
+            anthropic_api_key="test-anthropic-key",
+            embedding_model="text-embedding-3-small",
+            chat_model="claude-haiku-4-5-20251001",
+            chroma_directory=Path(self.temp_dir.name) / "oversized-chroma",
+            documents_registry_path=Path(self.temp_dir.name) / "oversized-data" / "documents.json",
+            chunk_size=1000,
+            chunk_overlap=200,
+            retrieve_k=3,
+            max_upload_size_bytes=1024 * 1024,
+            provider_max_retries=0,
+            openai_timeout_seconds=30,
+            anthropic_timeout_seconds=30,
+            chroma_anonymized_telemetry=False,
+            cag_max_pages=1,
+            cag_max_characters=20,
+            anthropic_prompt_cache_ttl="5m",
+        )
+        oversized_service = TestableRagService(oversized_settings, FakeVectorStore())
+        oversized_service.registry.add_document(
+            document_id="doc-big",
+            filename="big.txt",
+            content_type="text/plain",
+            page_count=2,
+            chunk_count=2,
+            chunking_strategy="research_paper",
+            chunk_size=1000,
+            chunk_overlap=200,
+        )
+
+        with self.assertRaises(DocumentProcessingError) as context:
+            oversized_service.answer_with_context(
+                ChatRequest(
+                    question="Summarize this document",
+                    document_id="doc-big",
+                    retrieval_mode="cag",
+                )
+            )
+
+        self.assertIn("too large for CAG mode", str(context.exception))
+
+    def cag_document_text(self):
+        return self.service.cag_messages[0][1].content[0]["text"]

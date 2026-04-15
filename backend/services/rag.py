@@ -11,6 +11,7 @@ from chromadb.config import Settings as ChromaClientSettings
 from langchain_anthropic import ChatAnthropic
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import OpenAIEmbeddings
 from pypdf import PdfReader
@@ -52,12 +53,24 @@ Question:
 {question}
 """
 
+CAG_SYSTEM_PROMPT = """You are answering questions about a user-uploaded document.
+The full document has been preloaded into context.
+Use only the provided document text to answer the question.
+If the answer is not supported by the document, say that it is not present in the indexed document.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class RagQueryResult:
     answer: str
     document_id: str
     retrieved_documents: list[Document]
+
+
+@dataclass(frozen=True, slots=True)
+class CagContext:
+    full_text: str
+    page_documents: list[Document]
 
 
 class RagService:
@@ -198,6 +211,22 @@ class RagService:
 
     def answer_with_context(self, request: ChatRequest) -> RagQueryResult:
         document_id = self._resolve_document_id(request.document_id)
+        if request.retrieval_mode == "cag":
+            context = self._load_cag_context(document_id)
+            answer = self._generate_cag_answer(request.question, document_id, context.full_text)
+
+            self.logger.info(
+                "Answered question against document %s using CAG over %s page(s)",
+                document_id,
+                len(context.page_documents),
+            )
+
+            return RagQueryResult(
+                answer=answer,
+                document_id=document_id,
+                retrieved_documents=context.page_documents,
+            )
+
         results = self._retrieve_documents(
             request.question,
             document_id,
@@ -340,6 +369,139 @@ class RagService:
             raise UpstreamServiceError("Failed to generate an answer from the indexed document.") from exc
 
         return self._normalize_answer_content(response.content)
+
+    def _load_cag_context(self, document_id: str) -> CagContext:
+        document = self.registry.get_document(document_id) or {}
+        page_count = document.get("page_count")
+        if page_count is not None and int(page_count) > self.settings.cag_max_pages:
+            raise DocumentProcessingError(
+                "This document is too large for CAG mode. Use chunk/page retrieval or raise the CAG limits."
+            )
+
+        try:
+            stored = self._get_vectorstore().get(
+                where={
+                    "$and": [
+                        {"document_id": document_id},
+                        {"retrieval_unit": "page"},
+                    ]
+                },
+                include=["documents", "metadatas"],
+            )
+        except ConfigurationError:
+            raise
+        except Exception as exc:
+            raise UpstreamServiceError("Failed to load full-document context for CAG mode.") from exc
+
+        raw_documents = stored.get("documents") or []
+        raw_metadatas = stored.get("metadatas") or []
+        page_documents: list[Document] = []
+
+        for text, metadata in zip(raw_documents, raw_metadatas):
+            if not isinstance(text, str) or not text.strip():
+                continue
+
+            normalized_metadata = dict(metadata or {})
+            normalized_metadata["retrieval_unit"] = "cag"
+            page_documents.append(
+                Document(
+                    page_content=text,
+                    metadata=normalized_metadata,
+                )
+            )
+
+        page_documents.sort(key=lambda doc: int((doc.metadata or {}).get("page", 0) or 0))
+        if not page_documents:
+            raise DocumentProcessingError(
+                "CAG mode is not available for this document yet. Re-upload it to build page indexes."
+            )
+
+        if len(page_documents) > self.settings.cag_max_pages:
+            raise DocumentProcessingError(
+                "This document is too large for CAG mode. Use chunk/page retrieval or raise the CAG limits."
+            )
+
+        full_text = "\n\n".join(
+            self._format_page_for_cag(document)
+            for document in page_documents
+            if document.page_content.strip()
+        )
+        if len(full_text) > self.settings.cag_max_characters:
+            raise DocumentProcessingError(
+                "This document is too large for CAG mode. Use chunk/page retrieval or raise the CAG limits."
+            )
+
+        return CagContext(
+            full_text=full_text,
+            page_documents=page_documents,
+        )
+
+    def _generate_cag_answer(
+        self,
+        question: str,
+        document_id: str,
+        full_text: str,
+    ) -> str:
+        cached_messages = self._build_cag_messages(question, full_text, use_prompt_cache=True)
+
+        try:
+            response = self._invoke_cag_model(cached_messages)
+        except ConfigurationError:
+            raise
+        except Exception as exc:
+            self.logger.warning(
+                "Prompt-cached CAG request failed for %s; retrying without prompt caching.",
+                document_id,
+                exc_info=exc,
+            )
+            uncached_messages = self._build_cag_messages(
+                question,
+                full_text,
+                use_prompt_cache=False,
+            )
+            try:
+                response = self._invoke_cag_model(uncached_messages)
+            except ConfigurationError:
+                raise
+            except Exception as retry_exc:
+                self.logger.exception("Failed to generate CAG answer for document %s", document_id)
+                raise UpstreamServiceError(
+                    "Failed to generate an answer from the full document context."
+                ) from retry_exc
+
+        return self._normalize_answer_content(response.content)
+
+    def _build_cag_messages(
+        self,
+        question: str,
+        full_text: str,
+        *,
+        use_prompt_cache: bool,
+    ) -> list[SystemMessage | HumanMessage]:
+        document_block: dict[str, object] = {
+            "type": "text",
+            "text": f"Document context:\n{full_text}",
+        }
+        if use_prompt_cache:
+            document_block["cache_control"] = {
+                "type": "ephemeral",
+                "ttl": self.settings.anthropic_prompt_cache_ttl,
+            }
+
+        return [
+            SystemMessage(content=CAG_SYSTEM_PROMPT),
+            HumanMessage(content=[document_block]),
+            HumanMessage(content=f"Question:\n{question}"),
+        ]
+
+    def _invoke_cag_model(self, messages: list[SystemMessage | HumanMessage]) -> object:
+        return self._get_llm().invoke(messages)
+
+    def _format_page_for_cag(self, document: Document) -> str:
+        page_number = (document.metadata or {}).get("page")
+        if page_number is None:
+            return document.page_content
+        return f"[Page {page_number}]\n{document.page_content}"
 
     def _extract_documents(
         self,

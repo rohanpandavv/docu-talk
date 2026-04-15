@@ -129,15 +129,16 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
 
-    def test_chat_accepts_page_retrieval_mode(self):
-        response = self.client.post(
-            "/chat",
-            json={"question": "What is this about?", "retrieval_mode": "page"},
-        )
+    def test_chat_accepts_non_default_retrieval_modes(self):
+        for retrieval_mode in ("page", "cag"):
+            response = self.client.post(
+                "/chat",
+                json={"question": "What is this about?", "retrieval_mode": retrieval_mode},
+            )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(self.fake_service.chat_calls[0].retrieval_mode, "page")
-        self.assertEqual(response.json()["sources"][0]["retrieval_unit"], "page")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(self.fake_service.chat_calls[-1].retrieval_mode, retrieval_mode)
+            self.assertEqual(response.json()["sources"][0]["retrieval_unit"], retrieval_mode)
 
     def test_list_documents_returns_active_document(self):
         response = self.client.get("/documents")
