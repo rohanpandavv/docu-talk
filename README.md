@@ -4,10 +4,11 @@ DocuTalk lets you have a conversation with your documents. Upload a PDF or text 
 
 It works using **Retrieval-Augmented Generation (RAG)**: instead of asking an LLM to rely on its training data alone (which can lead to hallucinations), we feed it the exact excerpts from your document that are relevant to your question. The LLM's job is reduced from "know everything" to "read and summarize what's in front of it," which is generally more reliable.
 
-The app now supports two retrieval modes:
+The app now supports three retrieval modes:
 
 - `chunk` retrieval: searches smaller text spans for tighter, more precise matches
 - `page` retrieval: searches full document pages for broader, page-level context
+- `cag` mode: loads the full document into prompt context for smaller uploads
 
 ## Architecture
 
@@ -57,10 +58,10 @@ flowchart LR
 
 **Querying (chat):**
 1. User asks a question against either an explicit `document_id` or the active document
-2. The question is embedded using the same OpenAI model
-3. ChromaDB returns the top 3 most similar indexed units for that specific document, based on the selected retrieval mode
-4. The retrieved chunks or pages are injected as context into a prompt template
-5. Claude Haiku 4.5 generates an answer based on the retrieved context
+2. The selected retrieval mode decides how context is prepared
+3. `chunk` and `page` modes run similarity search over the matching indexed units in ChromaDB
+4. `cag` mode loads the stored page text for the whole document and sends it directly as prompt context
+5. Claude Haiku 4.5 generates an answer grounded in the selected context
 6. The API returns the answer along with lightweight source snippets
 
 ## Tech Stack
@@ -135,6 +136,16 @@ Research papers, reports, and transcripts often behave differently during retrie
 
 **Tradeoff:** Page retrieval can pull in more irrelevant text than chunk retrieval, so it is not automatically better for every question.
 
+### Why add CAG on top of RAG?
+
+CAG, or Cache-Augmented Generation, is useful when the full document is small enough to fit comfortably in model context.
+
+- removes retrieval errors entirely for smaller documents
+- works well for broad questions like summaries or “what is this paper about?”
+- can reuse Anthropic prompt caching to avoid reprocessing the static document prefix every time
+
+**Tradeoff:** CAG is not scalable to large documents. That is why DocuTalk keeps it behind size limits and still uses chunk/page retrieval for larger uploads.
+
 ### Why FastAPI + Streamlit instead of a single app?
 
 - **Wanted a UI instead of API docs** : I wanted to see how the project would feel in a chat interface instead of only accessing it through the API documentation. That made the project more alive to me. Streamlit was the easiest way to spin up a chat user interface and I was already familiar with the library.
@@ -182,6 +193,9 @@ ANTHROPIC_CHAT_MODEL=claude-haiku-4-5-20251001
 CHUNK_SIZE=1000
 CHUNK_OVERLAP=200
 RETRIEVE_K=3
+CAG_MAX_PAGES=12
+CAG_MAX_CHARACTERS=50000
+ANTHROPIC_PROMPT_CACHE_TTL=5m
 MAX_UPLOAD_SIZE_BYTES=10485760
 PROVIDER_MAX_RETRIES=2
 OPENAI_TIMEOUT_SECONDS=30
@@ -237,7 +251,7 @@ streamlit run app.py
 | GET | `/documents` | - | List indexed documents and the current active document |
 | POST | `/documents/{document_id}/activate` | - | Mark a document as the default target for chat requests |
 | DELETE | `/documents/{document_id}` | - | Remove a document and its embeddings |
-| POST | `/chat` | `{"question": "...", "document_id": "optional", "retrieval_mode": "chunk|page"}` | Ask a question about the active document or an explicit document id |
+| POST | `/chat` | `{"question": "...", "document_id": "optional", "retrieval_mode": "chunk|page|cag"}` | Ask a question about the active document or an explicit document id |
 
 ### Example responses
 
@@ -298,6 +312,7 @@ streamlit run app.py
 - Scoped retrieval to a single document to avoid mixing chunks from different uploads
 - Added selectable chunking presets so indexing can be tuned by document type without exposing raw chunk parameters in the UI
 - Added page-aware indexing and a chat-time retrieval mode switch so chunk and page retrieval can be compared directly
+- Added a CAG mode for smaller documents that loads full-document page text into prompt context with prompt-caching support
 - Added stronger upload validation, clearer service errors, and source snippets in chat responses
 - Added request/provider timeouts and better logging so indexing failures surface instead of hanging silently
 
