@@ -38,6 +38,11 @@ FALLBACK_CHUNKING_STRATEGIES = {
     ],
 }
 
+RETRIEVAL_MODE_LABELS = {
+    "chunk": "Chunk retrieval",
+    "page": "Page retrieval",
+}
+
 
 def extract_error_message(response):
     if response is None:
@@ -101,6 +106,19 @@ st.caption(
     f"Chunk size: {selected_strategy['chunk_size']}, overlap: {selected_strategy['chunk_overlap']}."
 )
 
+selected_retrieval_mode = st.radio(
+    "Retrieval mode",
+    options=list(RETRIEVAL_MODE_LABELS.keys()),
+    index=0,
+    horizontal=True,
+    format_func=lambda key: RETRIEVAL_MODE_LABELS[key],
+    key="selected_retrieval_mode",
+    help=(
+        "Chunk retrieval is narrower and more precise. "
+        "Page retrieval searches full pages for broader context."
+    ),
+)
+
 if uploaded_file:
     if st.button("Process Document"):
         with st.spinner("Indexing document.."):
@@ -149,6 +167,7 @@ if prompt := st.chat_input("Ask a question about the paper.."):
         payload = {"question": prompt}
         if st.session_state.active_document_id:
             payload["document_id"] = st.session_state.active_document_id
+        payload["retrieval_mode"] = selected_retrieval_mode
 
         try:
             response = requests.post(

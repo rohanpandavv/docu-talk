@@ -4,6 +4,11 @@ DocuTalk lets you have a conversation with your documents. Upload a PDF or text 
 
 It works using **Retrieval-Augmented Generation (RAG)**: instead of asking an LLM to rely on its training data alone (which can lead to hallucinations), we feed it the exact excerpts from your document that are relevant to your question. The LLM's job is reduced from "know everything" to "read and summarize what's in front of it," which is generally more reliable.
 
+The app now supports two retrieval modes:
+
+- `chunk` retrieval: searches smaller text spans for tighter, more precise matches
+- `page` retrieval: searches full document pages for broader, page-level context
+
 ## Architecture
 
 ```mermaid
@@ -53,8 +58,8 @@ flowchart LR
 **Querying (chat):**
 1. User asks a question against either an explicit `document_id` or the active document
 2. The question is embedded using the same OpenAI model
-3. ChromaDB returns the top 3 most similar chunks for that specific document
-4. The chunks are injected as context into a prompt template
+3. ChromaDB returns the top 3 most similar indexed units for that specific document, based on the selected retrieval mode
+4. The retrieved chunks or pages are injected as context into a prompt template
 5. Claude Haiku 4.5 generates an answer based on the retrieved context
 6. The API returns the answer along with lightweight source snippets
 
@@ -121,6 +126,14 @@ Research papers, reports, and transcripts often behave differently during retrie
 - `Notes / Transcript`: uses smaller chunks for rapid topic shifts, bullets, and conversational text
 
 **Tradeoff:** This is more flexible than a single global strategy, but still simpler and safer than exposing raw chunk-size tuning to every user.
+
+### Why add page-level retrieval on top of chunk retrieval?
+
+- Page retrieval gives the model a wider local context, which can help with answers that span multiple nearby paragraphs
+- Chunk retrieval stays useful when you want the narrowest possible match and less prompt bloat
+- Keeping both modes makes it easier to compare retrieval granularity without changing the rest of the architecture
+
+**Tradeoff:** Page retrieval can pull in more irrelevant text than chunk retrieval, so it is not automatically better for every question.
 
 ### Why FastAPI + Streamlit instead of a single app?
 
@@ -224,7 +237,7 @@ streamlit run app.py
 | GET | `/documents` | - | List indexed documents and the current active document |
 | POST | `/documents/{document_id}/activate` | - | Mark a document as the default target for chat requests |
 | DELETE | `/documents/{document_id}` | - | Remove a document and its embeddings |
-| POST | `/chat` | `{"question": "...", "document_id": "optional"}` | Ask a question about the active document or an explicit document id |
+| POST | `/chat` | `{"question": "...", "document_id": "optional", "retrieval_mode": "chunk|page"}` | Ask a question about the active document or an explicit document id |
 
 ### Example responses
 
@@ -252,6 +265,7 @@ streamlit run app.py
   "message": "Document indexed successfully!",
   "document_id": "2f2f1e74-3d8d-4c2e-b7eb-4b986c9f4201",
   "filename": "paper.pdf",
+  "page_count": 8,
   "chunk_count": 12,
   "chunking_strategy": "research_paper",
   "chunk_size": 1000,
@@ -270,6 +284,7 @@ streamlit run app.py
       "source": "paper.pdf",
       "page": 3,
       "chunk_index": 5,
+      "retrieval_unit": "chunk",
       "excerpt": "..."
     }
   ]
@@ -282,6 +297,7 @@ streamlit run app.py
 - Added a persistent document registry so uploads can be listed, activated, and deleted cleanly
 - Scoped retrieval to a single document to avoid mixing chunks from different uploads
 - Added selectable chunking presets so indexing can be tuned by document type without exposing raw chunk parameters in the UI
+- Added page-aware indexing and a chat-time retrieval mode switch so chunk and page retrieval can be compared directly
 - Added stronger upload validation, clearer service errors, and source snippets in chat responses
 - Added request/provider timeouts and better logging so indexing failures surface instead of hanging silently
 
@@ -302,6 +318,7 @@ DocuTalk/
 │   ├── tests/
 │   │   ├── test_api.py           # API-level tests with service overrides
 │   │   ├── test_chunking.py      # Chunking preset tests
+│   │   ├── test_rag_service.py   # Retrieval and indexing unit tests
 │   │   └── test_registry.py      # Registry behavior tests
 │   ├── requirements.txt
 │   └── .env                 # API keys, chunking, logging, and timeout settings
