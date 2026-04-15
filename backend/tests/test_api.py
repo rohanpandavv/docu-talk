@@ -9,6 +9,7 @@ from services.rag import get_rag_service
 class FakeRagService:
     def __init__(self):
         self.upload_calls = []
+        self.chat_calls = []
 
     def ingest_document(self, filename, content_type, content, chunking_strategy=None):
         self.upload_calls.append((filename, content_type, content, chunking_strategy))
@@ -16,6 +17,7 @@ class FakeRagService:
             "message": "Document indexed successfully!",
             "document_id": "doc-123",
             "filename": filename,
+            "page_count": 1,
             "chunk_count": 1,
             "chunking_strategy": chunking_strategy or "research_paper",
             "chunk_size": 1000,
@@ -23,6 +25,7 @@ class FakeRagService:
         }
 
     def chat(self, request):
+        self.chat_calls.append(request)
         return {
             "answer": f"Answer for {request.question}",
             "document_id": request.document_id or "doc-123",
@@ -31,6 +34,7 @@ class FakeRagService:
                     "source": "demo.txt",
                     "page": 1,
                     "chunk_index": 0,
+                    "retrieval_unit": request.retrieval_mode,
                     "excerpt": "demo excerpt",
                 }
             ],
@@ -44,6 +48,7 @@ class FakeRagService:
                     "document_id": "doc-123",
                     "filename": "demo.txt",
                     "content_type": "text/plain",
+                    "page_count": 1,
                     "chunk_count": 1,
                     "chunking_strategy": "research_paper",
                     "chunk_size": 1000,
@@ -59,6 +64,7 @@ class FakeRagService:
             "document_id": document_id,
             "filename": "demo.txt",
             "content_type": "text/plain",
+            "page_count": 1,
             "chunk_count": 1,
             "chunking_strategy": "research_paper",
             "chunk_size": 1000,
@@ -115,12 +121,23 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.json()["document_id"], "doc-123")
         self.assertEqual(self.fake_service.upload_calls[0][0], "demo.txt")
         self.assertEqual(self.fake_service.upload_calls[0][3], "notes_transcript")
+        self.assertEqual(response.json()["page_count"], 1)
         self.assertEqual(response.json()["chunking_strategy"], "notes_transcript")
 
     def test_chat_rejects_blank_question(self):
         response = self.client.post("/chat", json={"question": "   "})
 
         self.assertEqual(response.status_code, 422)
+
+    def test_chat_accepts_page_retrieval_mode(self):
+        response = self.client.post(
+            "/chat",
+            json={"question": "What is this about?", "retrieval_mode": "page"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.fake_service.chat_calls[0].retrieval_mode, "page")
+        self.assertEqual(response.json()["sources"][0]["retrieval_unit"], "page")
 
     def test_list_documents_returns_active_document(self):
         response = self.client.get("/documents")

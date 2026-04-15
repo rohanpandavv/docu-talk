@@ -20,6 +20,7 @@ from schemas import (
     ChatRequest,
     ChatResponse,
     ChunkingStrategiesResponse,
+    DEFAULT_RETRIEVAL_MODE,
     DocumentDeleteResponse,
     DocumentListResponse,
     DocumentSummary,
@@ -114,7 +115,8 @@ class RagService:
         if not chunked_documents:
             raise DocumentProcessingError("The uploaded document did not produce any chunks.")
         self.logger.info(
-            "Prepared %s chunk(s) for %s using %s (%s/%s); starting embedding/indexing",
+            "Prepared %s page record(s) and %s chunk(s) for %s using %s (%s/%s); starting embedding/indexing",
+            len(source_documents),
             len(chunked_documents),
             safe_filename,
             strategy.key,
@@ -123,24 +125,25 @@ class RagService:
         )
 
         document_id = str(uuid4())
-        texts: list[str] = []
-        metadatas: list[dict[str, object]] = []
-        ids: list[str] = []
-
-        for index, chunk in enumerate(chunked_documents):
-            metadata = {key: value for key, value in chunk.metadata.items() if value is not None}
-            metadata.update(
-                {
-                    "document_id": document_id,
-                    "source": safe_filename,
-                    "content_type": resolved_content_type,
-                    "chunk_index": index,
-                    "chunking_strategy": strategy.key,
-                }
-            )
-            texts.append(chunk.page_content)
-            metadatas.append(metadata)
-            ids.append(f"{document_id}:{index}")
+        page_texts, page_metadatas, page_ids = self._build_index_records(
+            documents=source_documents,
+            document_id=document_id,
+            filename=safe_filename,
+            content_type=resolved_content_type,
+            chunking_strategy=strategy.key,
+            retrieval_unit="page",
+        )
+        chunk_texts, chunk_metadatas, chunk_ids = self._build_index_records(
+            documents=chunked_documents,
+            document_id=document_id,
+            filename=safe_filename,
+            content_type=resolved_content_type,
+            chunking_strategy=strategy.key,
+            retrieval_unit="chunk",
+        )
+        texts = [*page_texts, *chunk_texts]
+        metadatas = [*page_metadatas, *chunk_metadatas]
+        ids = [*page_ids, *chunk_ids]
 
         try:
             self._get_vectorstore().add_texts(texts=texts, metadatas=metadatas, ids=ids)
@@ -148,7 +151,8 @@ class RagService:
                 document_id=document_id,
                 filename=safe_filename,
                 content_type=resolved_content_type,
-                chunk_count=len(texts),
+                page_count=len(source_documents),
+                chunk_count=len(chunk_texts),
                 chunking_strategy=strategy.key,
                 chunk_size=strategy.chunk_size,
                 chunk_overlap=strategy.chunk_overlap,
@@ -165,7 +169,7 @@ class RagService:
             raise UpstreamServiceError("Failed to index the uploaded document.") from exc
 
         self.logger.info(
-            "Indexed document %s (%s) with %s chunks",
+            "Indexed document %s (%s) with %s total indexed unit(s)",
             document_id,
             safe_filename,
             len(texts),
@@ -175,7 +179,8 @@ class RagService:
             message="Document indexed successfully!",
             document_id=document_id,
             filename=safe_filename,
-            chunk_count=len(texts),
+            page_count=len(source_documents),
+            chunk_count=len(chunk_texts),
             chunking_strategy=strategy.key,
             chunk_size=strategy.chunk_size,
             chunk_overlap=strategy.chunk_overlap,
@@ -193,13 +198,18 @@ class RagService:
 
     def answer_with_context(self, request: ChatRequest) -> RagQueryResult:
         document_id = self._resolve_document_id(request.document_id)
-        results = self._retrieve_documents(request.question, document_id)
+        results = self._retrieve_documents(
+            request.question,
+            document_id,
+            request.retrieval_mode,
+        )
         answer = self._generate_answer(request.question, document_id, results)
 
         self.logger.info(
-            "Answered question against document %s using %s retrieved chunks",
+            "Answered question against document %s using %s retrieved %s unit(s)",
             document_id,
             len(results),
+            request.retrieval_mode,
         )
 
         return RagQueryResult(
@@ -254,21 +264,53 @@ class RagService:
 
         return document_id
 
-    def _retrieve_documents(self, question: str, document_id: str) -> list[Document]:
-        self.logger.info("Starting retrieval for document %s", document_id)
+    def _retrieve_documents(
+        self,
+        question: str,
+        document_id: str,
+        retrieval_mode: str = DEFAULT_RETRIEVAL_MODE,
+    ) -> list[Document]:
+        self.logger.info("Starting %s retrieval for document %s", retrieval_mode, document_id)
+        primary_filter = {
+            "$and": [
+                {"document_id": document_id},
+                {"retrieval_unit": retrieval_mode},
+            ]
+        }
 
         try:
             results = self._get_vectorstore().similarity_search(
                 question,
                 k=self.settings.retrieve_k,
-                filter={"document_id": document_id},
+                filter=primary_filter,
             )
         except ConfigurationError:
             raise
         except Exception as exc:
             raise UpstreamServiceError("Failed to retrieve document context.") from exc
 
+        if not results and retrieval_mode == DEFAULT_RETRIEVAL_MODE:
+            self.logger.info(
+                "No %s-tagged records found for %s. Falling back to legacy chunk retrieval.",
+                retrieval_mode,
+                document_id,
+            )
+            try:
+                results = self._get_vectorstore().similarity_search(
+                    question,
+                    k=self.settings.retrieve_k,
+                    filter={"document_id": document_id},
+                )
+            except ConfigurationError:
+                raise
+            except Exception as exc:
+                raise UpstreamServiceError("Failed to retrieve document context.") from exc
+
         if not results:
+            if retrieval_mode == "page":
+                raise DocumentProcessingError(
+                    "Page retrieval is not available for this document yet. Re-upload it to build page indexes."
+                )
             raise DocumentProcessingError(
                 "No indexed chunks were found for the requested document."
             )
@@ -352,6 +394,45 @@ class RagService:
 
         return [Document(page_content=text, metadata={"page": 1})]
 
+    def _build_index_records(
+        self,
+        *,
+        documents: list[Document],
+        document_id: str,
+        filename: str,
+        content_type: str,
+        chunking_strategy: str,
+        retrieval_unit: str,
+    ) -> tuple[list[str], list[dict[str, object]], list[str]]:
+        texts: list[str] = []
+        metadatas: list[dict[str, object]] = []
+        ids: list[str] = []
+
+        for index, document in enumerate(documents):
+            metadata = {key: value for key, value in document.metadata.items() if value is not None}
+            metadata.update(
+                {
+                    "document_id": document_id,
+                    "source": filename,
+                    "content_type": content_type,
+                    "chunking_strategy": chunking_strategy,
+                    "retrieval_unit": retrieval_unit,
+                }
+            )
+
+            if retrieval_unit == "chunk":
+                metadata["chunk_index"] = index
+                record_id = f"{document_id}:chunk:{index}"
+            else:
+                page_number = int(metadata.get("page", index + 1))
+                record_id = f"{document_id}:page:{page_number}"
+
+            texts.append(document.page_content)
+            metadatas.append(metadata)
+            ids.append(record_id)
+
+        return texts, metadatas, ids
+
     def _content_type_from_filename(self, filename: str) -> str:
         extension = Path(filename).suffix.lower()
         if extension == ".pdf":
@@ -415,7 +496,10 @@ class RagService:
         return SourceSnippet(
             source=str(metadata.get("source", "document")),
             page=metadata.get("page"),
-            chunk_index=int(metadata.get("chunk_index", 0)),
+            chunk_index=(
+                int(metadata["chunk_index"]) if metadata.get("chunk_index") is not None else None
+            ),
+            retrieval_unit=str(metadata.get("retrieval_unit", DEFAULT_RETRIEVAL_MODE)),
             excerpt=excerpt,
         )
 

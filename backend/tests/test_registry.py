@@ -18,6 +18,7 @@ class DocumentRegistryTests(unittest.TestCase):
             document_id="doc-1",
             filename="first.txt",
             content_type="text/plain",
+            page_count=1,
             chunk_count=2,
             chunking_strategy="research_paper",
             chunk_size=1000,
@@ -27,6 +28,7 @@ class DocumentRegistryTests(unittest.TestCase):
             document_id="doc-2",
             filename="second.txt",
             content_type="text/plain",
+            page_count=1,
             chunk_count=4,
             chunking_strategy="notes_transcript",
             chunk_size=650,
@@ -38,12 +40,14 @@ class DocumentRegistryTests(unittest.TestCase):
         self.assertEqual(listing["active_document_id"], "doc-2")
         self.assertEqual([doc["document_id"] for doc in listing["documents"]], ["doc-2", "doc-1"])
         self.assertEqual(listing["documents"][0]["chunking_strategy"], "notes_transcript")
+        self.assertEqual(listing["documents"][0]["page_count"], 1)
 
     def test_delete_active_document_promotes_next_document(self):
         self.registry.add_document(
             document_id="doc-1",
             filename="first.txt",
             content_type="text/plain",
+            page_count=1,
             chunk_count=2,
             chunking_strategy="research_paper",
             chunk_size=1000,
@@ -53,6 +57,7 @@ class DocumentRegistryTests(unittest.TestCase):
             document_id="doc-2",
             filename="second.txt",
             content_type="text/plain",
+            page_count=2,
             chunk_count=4,
             chunking_strategy="general_article",
             chunk_size=1200,
