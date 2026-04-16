@@ -4,6 +4,13 @@ from dotenv import load_dotenv
 from pathlib import Path
 import os
 
+from chat_ui import (
+    build_assistant_message,
+    build_chat_payload,
+    format_source_label,
+    summarize_citation_verification,
+)
+
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR/".env")
 
@@ -74,6 +81,39 @@ def fetch_chunking_strategies():
         return response.json()
     except requests.RequestException:
         return FALLBACK_CHUNKING_STRATEGIES
+
+
+def render_sources(sources):
+    if not sources:
+        return
+
+    with st.expander("Sources", expanded=True):
+        for source in sources:
+            st.markdown(f"**{format_source_label(source)}**")
+            excerpt = source.get("excerpt")
+            if excerpt:
+                st.caption(excerpt)
+
+
+def render_citation_verification(citation_verification):
+    summary = summarize_citation_verification(citation_verification)
+    if not summary:
+        return
+
+    if (
+        citation_verification.get("grounded")
+        and citation_verification.get("all_citations_valid")
+    ):
+        st.caption(summary)
+        return
+
+    st.warning(summary)
+    for issue in citation_verification.get("unsupported_claims") or []:
+        claim = issue.get("claim", "Unsupported claim")
+        reason = issue.get("reason", "")
+        cited_source_ids = issue.get("cited_source_ids") or []
+        citation_label = f" Cited: {', '.join(cited_source_ids)}." if cited_source_ids else ""
+        st.write(f"- {claim}. {reason}{citation_label}".strip())
 
 st.title("DocuTalk - Talk to Research Papers")
 
@@ -161,6 +201,9 @@ if "messages" not in st.session_state:
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        if message["role"] == "assistant":
+            render_citation_verification(message.get("citation_verification"))
+            render_sources(message.get("sources") or [])
 
 if prompt := st.chat_input("Ask a question about the paper.."):
     st.session_state.messages.append({"role": "user", "content": prompt})
@@ -168,10 +211,12 @@ if prompt := st.chat_input("Ask a question about the paper.."):
         st.markdown(prompt)
     
     with st.chat_message("assistant"):
-        payload = {"question": prompt}
-        if st.session_state.active_document_id:
-            payload["document_id"] = st.session_state.active_document_id
-        payload["retrieval_mode"] = selected_retrieval_mode
+        payload = build_chat_payload(
+            question=prompt,
+            active_document_id=st.session_state.active_document_id,
+            retrieval_mode=selected_retrieval_mode,
+        )
+        response_payload = None
 
         try:
             response = requests.post(
@@ -189,5 +234,11 @@ if prompt := st.chat_input("Ask a question about the paper.."):
         except requests.RequestException as exc:
             answer = extract_error_message(exc.response)
 
-        st.markdown(answer)
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+        assistant_message = build_assistant_message(
+            response_payload,
+            fallback_answer=answer,
+        )
+        st.markdown(assistant_message["content"])
+        render_citation_verification(assistant_message.get("citation_verification"))
+        render_sources(assistant_message.get("sources") or [])
+    st.session_state.messages.append(assistant_message)
