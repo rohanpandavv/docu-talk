@@ -197,6 +197,149 @@ class RagServiceTests(unittest.TestCase):
         )
         self.assertIn("[S1] | demo.txt | page 1 | unit page", self.service.answer_prompt_inputs[0]["context"])
 
+    def test_summary_questions_expand_chunk_context_with_summary_supporting_chunks(self):
+        self.service.registry.add_document(
+            document_id="doc-summary",
+            filename="paper.pdf",
+            content_type="application/pdf",
+            page_count=25,
+            chunk_count=6,
+            chunking_strategy="research_paper",
+            chunk_size=1000,
+            chunk_overlap=200,
+        )
+        chunk_filter = (
+            "$and",
+            (
+                (("document_id", "doc-summary"),),
+                (("retrieval_unit", "chunk"),),
+            ),
+        )
+        self.vectorstore.search_results[chunk_filter] = [
+            Document(
+                page_content=(
+                    "permission to distribute, please contact demo@example.com "
+                    "Department of Philosophy University of Pennsylvania"
+                ),
+                metadata={
+                    "document_id": "doc-summary",
+                    "source": "paper.pdf",
+                    "page": 1,
+                    "chunk_index": 3,
+                    "retrieval_unit": "chunk",
+                },
+            ),
+            Document(
+                page_content=(
+                    "Smith, J. (2024). Conference paper. Doe, A. (2023). Journal article. "
+                    "Brown, P. (2022). Proceedings paper. Taylor, R. (2021). DOI record."
+                ),
+                metadata={
+                    "document_id": "doc-summary",
+                    "source": "paper.pdf",
+                    "page": 25,
+                    "chunk_index": 87,
+                    "retrieval_unit": "chunk",
+                },
+            ),
+        ]
+        self.vectorstore.get_results[chunk_filter] = {
+            "ids": ["c0", "c1", "c2", "c3", "c4", "c5"],
+            "documents": [
+                (
+                    "The Future of AI is Many, Not One. Abstract. In this paper we argue "
+                    "that the future of AI is better understood as diverse AI teams."
+                ),
+                (
+                    "We highlight three worries about current language models and explain "
+                    "why a multi-agent perspective addresses them."
+                ),
+                (
+                    "In section 2 we review objections, in section 3 we defend the team-based "
+                    "picture, and in section 4 we conclude with implications."
+                ),
+                (
+                    "permission to distribute, please contact demo@example.com "
+                    "Department of Philosophy University of Pennsylvania"
+                ),
+                (
+                    "Smith, J. (2024). Conference paper. Doe, A. (2023). Journal article. "
+                    "Brown, P. (2022). Proceedings paper. Taylor, R. (2021). DOI record. "
+                    "Miller, C. (2020). Another proceedings paper. Wilson, D. (2019). Arxiv preprint."
+                ),
+                (
+                    "Introduction. This paper examines why singular AGI narratives are misleading "
+                    "and proposes coordinated AI teams as an alternative."
+                ),
+            ],
+            "metadatas": [
+                {
+                    "document_id": "doc-summary",
+                    "source": "paper.pdf",
+                    "page": 1,
+                    "chunk_index": 0,
+                    "retrieval_unit": "chunk",
+                },
+                {
+                    "document_id": "doc-summary",
+                    "source": "paper.pdf",
+                    "page": 2,
+                    "chunk_index": 5,
+                    "retrieval_unit": "chunk",
+                },
+                {
+                    "document_id": "doc-summary",
+                    "source": "paper.pdf",
+                    "page": 2,
+                    "chunk_index": 6,
+                    "retrieval_unit": "chunk",
+                },
+                {
+                    "document_id": "doc-summary",
+                    "source": "paper.pdf",
+                    "page": 1,
+                    "chunk_index": 3,
+                    "retrieval_unit": "chunk",
+                },
+                {
+                    "document_id": "doc-summary",
+                    "source": "paper.pdf",
+                    "page": 25,
+                    "chunk_index": 87,
+                    "retrieval_unit": "chunk",
+                },
+                {
+                    "document_id": "doc-summary",
+                    "source": "paper.pdf",
+                    "page": 1,
+                    "chunk_index": 1,
+                    "retrieval_unit": "chunk",
+                },
+            ],
+        }
+
+        response = self.service.chat(
+            ChatRequest(
+                question="Could you summarize the research paper?",
+                document_id="doc-summary",
+                retrieval_mode="chunk",
+            )
+        )
+
+        self.assertGreater(len(response.sources), 2)
+        self.assertEqual(response.sources[0].page, 1)
+        self.assertEqual(response.sources[0].chunk_index, 0)
+        self.assertEqual(response.sources[1].page, 1)
+        self.assertEqual(response.sources[1].chunk_index, 1)
+        self.assertNotIn(
+            "chunk 87",
+            self.service.answer_prompt_inputs[0]["context"],
+        )
+        self.assertNotIn(
+            "permission to distribute",
+            self.service.answer_prompt_inputs[0]["context"],
+        )
+
     def test_chunk_retrieval_falls_back_to_legacy_documents(self):
         self.service.registry.add_document(
             document_id="doc-legacy",

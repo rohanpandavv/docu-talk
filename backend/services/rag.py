@@ -93,6 +93,36 @@ Source excerpts:
 HYBRID_VECTOR_CANDIDATE_MULTIPLIER = 4
 HYBRID_VECTOR_CANDIDATE_FLOOR = 10
 SOURCE_CITATION_PATTERN = re.compile(r"\[(S\d+(?:\s*,\s*S\d+)*)\]")
+SUMMARY_QUESTION_PATTERN = re.compile(
+    r"\b("
+    r"summarize|summary|overview|tl\s*;?\s*dr|main points|key points|"
+    r"main argument|main arguments|main findings|key findings|"
+    r"what is this paper about|what is this document about"
+    r")\b",
+    re.IGNORECASE,
+)
+REFERENCE_SECTION_PATTERN = re.compile(r"\b(references|bibliography|works cited)\b")
+REFERENCE_YEAR_PATTERN = re.compile(r"\b(?:19|20)\d{2}[a-z]?\b")
+SUMMARY_CONTEXT_TARGET_K = 6
+SUMMARY_SIGNAL_PATTERNS = (
+    "abstract",
+    "introduction",
+    "in this paper",
+    "this paper",
+    "we argue",
+    "we propose",
+    "we show",
+    "we present",
+    "we highlight",
+    "we spell out",
+    "we defend",
+    "we conclude",
+    "we investigate",
+    "we explore",
+    "we examine",
+    "our thesis",
+    "our argument",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,6 +316,12 @@ class RagService:
             )
         if request.retrieval_mode == "hybrid":
             results = self._retrieve_hybrid_documents(request.question, document_id)
+            results = self._optimize_documents_for_question(
+                question=request.question,
+                document_id=document_id,
+                retrieval_mode=request.retrieval_mode,
+                retrieved_documents=results,
+            )
             citation_context = self._build_citation_context(results)
             answer = self._generate_answer(request.question, document_id, citation_context)
             citation_verification = self._evaluate_answer_citations(
@@ -313,6 +349,12 @@ class RagService:
             request.question,
             document_id,
             request.retrieval_mode,
+        )
+        results = self._optimize_documents_for_question(
+            question=request.question,
+            document_id=document_id,
+            retrieval_mode=request.retrieval_mode,
+            retrieved_documents=results,
         )
         citation_context = self._build_citation_context(results)
         answer = self._generate_answer(request.question, document_id, citation_context)
@@ -522,6 +564,34 @@ class RagService:
 
         return chunk_documents
 
+    def _load_page_documents(self, document_id: str) -> dict[str, Document]:
+        primary_filter = {
+            "$and": [
+                {"document_id": document_id},
+                {"retrieval_unit": "page"},
+            ]
+        }
+        stored = self._load_stored_documents(
+            document_id=document_id,
+            primary_filter=primary_filter,
+            legacy_error_message=(
+                "Page retrieval is not available for this document yet. Re-upload it to build page indexes."
+            ),
+        )
+
+        page_documents: dict[str, Document] = {}
+        for text, metadata in zip(
+            stored.get("documents") or [],
+            stored.get("metadatas") or [],
+            strict=False,
+        ):
+            if not isinstance(text, str) or not text.strip():
+                continue
+            document = Document(page_content=text, metadata=dict(metadata or {}))
+            page_documents[self._document_identity_key(document)] = document
+
+        return page_documents
+
     def _load_hybrid_vector_candidates(
         self,
         question: str,
@@ -607,6 +677,9 @@ class RagService:
         return legacy_stored
 
     def _hybrid_candidate_key(self, document: Document) -> str:
+        return self._document_identity_key(document)
+
+    def _document_identity_key(self, document: Document) -> str:
         metadata = document.metadata or {}
         return "|".join(
             [
@@ -614,6 +687,7 @@ class RagService:
                 str(metadata.get("source", "")),
                 str(metadata.get("page", "")),
                 str(metadata.get("chunk_index", "")),
+                str(metadata.get("retrieval_unit", "")),
             ]
         )
 
@@ -782,6 +856,171 @@ class RagService:
 
     def _invoke_grounding_evaluator(self, prompt_input: dict[str, str]) -> object:
         return (self.grounding_evaluator_prompt | self._get_llm()).invoke(prompt_input)
+
+    def _optimize_documents_for_question(
+        self,
+        *,
+        question: str,
+        document_id: str,
+        retrieval_mode: str,
+        retrieved_documents: list[Document],
+    ) -> list[Document]:
+        if not self._is_summary_question(question):
+            return retrieved_documents
+
+        try:
+            if retrieval_mode == "page":
+                candidate_documents = list(self._load_page_documents(document_id).values())
+            else:
+                candidate_documents = list(self._load_chunk_documents(document_id).values())
+        except (DocumentProcessingError, UpstreamServiceError):
+            self.logger.warning(
+                "Could not load supplemental summary context for %s; using primary retrieval results.",
+                document_id,
+            )
+            return retrieved_documents
+
+        optimized_documents = self._build_summary_context_documents(
+            base_documents=retrieved_documents,
+            candidate_documents=candidate_documents,
+        )
+        if optimized_documents != retrieved_documents:
+            self.logger.info(
+                "Expanded summary context for %s from %s to %s %s unit(s)",
+                document_id,
+                len(retrieved_documents),
+                len(optimized_documents),
+                retrieval_mode,
+            )
+        return optimized_documents
+
+    def _build_summary_context_documents(
+        self,
+        *,
+        base_documents: list[Document],
+        candidate_documents: list[Document],
+    ) -> list[Document]:
+        target_k = max(self.settings.retrieve_k, SUMMARY_CONTEXT_TARGET_K)
+        selected_documents: list[Document] = []
+        selected_keys: set[str] = set()
+
+        ranked_candidates = sorted(
+            candidate_documents,
+            key=self._summary_candidate_sort_key,
+            reverse=True,
+        )
+        for document in ranked_candidates:
+            score = self._score_summary_candidate(document)
+            if score <= 0:
+                continue
+
+            document_key = self._document_identity_key(document)
+            if document_key in selected_keys:
+                continue
+
+            selected_documents.append(document)
+            selected_keys.add(document_key)
+            if len(selected_documents) == target_k:
+                break
+
+        if not selected_documents:
+            return base_documents
+
+        for document in base_documents:
+            document_key = self._document_identity_key(document)
+            if document_key in selected_keys:
+                continue
+            if (
+                self._score_summary_candidate(document) <= 0
+                and len(selected_documents) >= self.settings.retrieve_k
+            ):
+                continue
+
+            selected_documents.append(document)
+            selected_keys.add(document_key)
+            if len(selected_documents) == target_k:
+                break
+
+        return selected_documents
+
+    def _summary_candidate_sort_key(self, document: Document) -> tuple[int, int, int]:
+        metadata = document.metadata or {}
+        page = int(metadata.get("page", 999) or 999)
+        raw_chunk_index = metadata.get("chunk_index")
+        chunk_index = 9999 if raw_chunk_index is None else int(raw_chunk_index)
+        return (
+            self._score_summary_candidate(document),
+            -page,
+            -chunk_index,
+        )
+
+    def _score_summary_candidate(self, document: Document) -> int:
+        text = " ".join(document.page_content.split()).lower()
+        metadata = document.metadata or {}
+        page = int(metadata.get("page", 0) or 0)
+        raw_chunk_index = metadata.get("chunk_index")
+        chunk_index = None if raw_chunk_index is None else int(raw_chunk_index)
+
+        score = 0
+        if page == 1:
+            score += 4
+        elif page <= 3:
+            score += 2
+        elif page <= 5:
+            score += 1
+
+        if chunk_index == 0:
+            score += 2
+
+        for pattern in SUMMARY_SIGNAL_PATTERNS:
+            if pattern in text:
+                score += 3
+
+        if "abstract" in text[:250]:
+            score += 6
+        if "conclusion" in text[:250] or "concluding" in text[:250]:
+            score += 4
+        if "in section" in text or "section 2" in text or "section 3" in text:
+            score += 2
+
+        if self._looks_like_reference_chunk(text):
+            score -= 12
+        if self._looks_like_front_matter(text):
+            score -= 8
+
+        return score
+
+    def _looks_like_reference_chunk(self, text: str) -> bool:
+        if REFERENCE_SECTION_PATTERN.search(text[:200]):
+            return True
+
+        year_count = len(REFERENCE_YEAR_PATTERN.findall(text))
+        reference_markers = sum(
+            text.count(marker)
+            for marker in (
+                " et al.",
+                " arxiv",
+                " proceedings",
+                " journal",
+                " conference",
+                " doi",
+            )
+        )
+        return year_count >= 8 and reference_markers >= 2
+
+    def _looks_like_front_matter(self, text: str) -> bool:
+        front_matter_markers = (
+            "permission to distribute",
+            "department of",
+            "university of",
+            "arxiv:",
+            "contact ",
+        )
+        has_summary_signal = any(pattern in text for pattern in SUMMARY_SIGNAL_PATTERNS)
+        return "@" in text and any(marker in text for marker in front_matter_markers) and not has_summary_signal
+
+    def _is_summary_question(self, question: str) -> bool:
+        return bool(SUMMARY_QUESTION_PATTERN.search(question))
 
     def _build_citation_context(self, documents: list[Document]) -> CitationContext:
         sources: list[SourceSnippet] = []
