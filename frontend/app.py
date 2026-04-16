@@ -40,6 +40,7 @@ FALLBACK_CHUNKING_STRATEGIES = {
 
 RETRIEVAL_MODE_LABELS = {
     "chunk": "Chunk retrieval",
+    "hybrid": "Hybrid (BM25 + vector)",
     "page": "Page retrieval",
     "cag": "CAG (full doc)",
 }
@@ -116,6 +117,7 @@ selected_retrieval_mode = st.radio(
     key="selected_retrieval_mode",
     help=(
         "Chunk retrieval is narrower and more precise. "
+        "Hybrid blends BM25 keyword matching with vector search. "
         "Page retrieval searches full pages for broader context. "
         "CAG loads the full document for smaller uploads."
     ),

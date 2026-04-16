@@ -4,9 +4,10 @@ DocuTalk lets you have a conversation with your documents. Upload a PDF or text 
 
 It works using **Retrieval-Augmented Generation (RAG)**: instead of asking an LLM to rely on its training data alone (which can lead to hallucinations), we feed it the exact excerpts from your document that are relevant to your question. The LLM's job is reduced from "know everything" to "read and summarize what's in front of it," which is generally more reliable.
 
-The app now supports three retrieval modes:
+The app now supports four retrieval modes:
 
 - `chunk` retrieval: searches smaller text spans for tighter, more precise matches
+- `hybrid` retrieval: blends BM25 keyword matching with vector search over chunks
 - `page` retrieval: searches full document pages for broader, page-level context
 - `cag` mode: loads the full document into prompt context for smaller uploads
 
@@ -60,9 +61,10 @@ flowchart LR
 1. User asks a question against either an explicit `document_id` or the active document
 2. The selected retrieval mode decides how context is prepared
 3. `chunk` and `page` modes run similarity search over the matching indexed units in ChromaDB
-4. `cag` mode loads the stored page text for the whole document and sends it directly as prompt context
-5. Claude Haiku 4.5 generates an answer grounded in the selected context
-6. The API returns the answer along with lightweight source snippets
+4. `hybrid` mode combines BM25 keyword scoring with vector ranking over chunk records
+5. `cag` mode loads the stored page text for the whole document and sends it directly as prompt context
+6. Claude Haiku 4.5 generates an answer grounded in the selected context
+7. The API returns the answer along with lightweight source snippets
 
 ## Tech Stack
 
@@ -145,6 +147,23 @@ CAG, or Cache-Augmented Generation, is useful when the full document is small en
 - can reuse Anthropic prompt caching to avoid reprocessing the static document prefix every time
 
 **Tradeoff:** CAG is not scalable to large documents. That is why DocuTalk keeps it behind size limits and still uses chunk/page retrieval for larger uploads.
+
+### Why add hybrid BM25 + vector retrieval?
+
+Hybrid retrieval is useful when queries depend on both:
+
+- semantic meaning
+- exact term overlap
+
+That matters for:
+
+- paper titles
+- acronyms
+- dataset names
+- citation strings
+- keyword-heavy user questions
+
+**Tradeoff:** Hybrid retrieval is more complex than pure vector search, but it is often more robust when exact lexical matches matter.
 
 ### Why FastAPI + Streamlit instead of a single app?
 
@@ -251,7 +270,7 @@ streamlit run app.py
 | GET | `/documents` | - | List indexed documents and the current active document |
 | POST | `/documents/{document_id}/activate` | - | Mark a document as the default target for chat requests |
 | DELETE | `/documents/{document_id}` | - | Remove a document and its embeddings |
-| POST | `/chat` | `{"question": "...", "document_id": "optional", "retrieval_mode": "chunk|page|cag"}` | Ask a question about the active document or an explicit document id |
+| POST | `/chat` | `{"question": "...", "document_id": "optional", "retrieval_mode": "chunk|hybrid|page|cag"}` | Ask a question about the active document or an explicit document id |
 
 ### Example responses
 
@@ -312,6 +331,7 @@ streamlit run app.py
 - Scoped retrieval to a single document to avoid mixing chunks from different uploads
 - Added selectable chunking presets so indexing can be tuned by document type without exposing raw chunk parameters in the UI
 - Added page-aware indexing and a chat-time retrieval mode switch so chunk and page retrieval can be compared directly
+- Added a hybrid BM25 + vector mode for chunk retrieval when exact terms and semantic similarity both matter
 - Added a CAG mode for smaller documents that loads full-document page text into prompt context with prompt-caching support
 - Added stronger upload validation, clearer service errors, and source snippets in chat responses
 - Added request/provider timeouts and better logging so indexing failures surface instead of hanging silently
