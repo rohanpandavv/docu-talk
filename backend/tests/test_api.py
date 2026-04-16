@@ -27,10 +27,11 @@ class FakeRagService:
     def chat(self, request):
         self.chat_calls.append(request)
         return {
-            "answer": f"Answer for {request.question}",
+            "answer": f"Answer for {request.question} [S1]",
             "document_id": request.document_id or "doc-123",
             "sources": [
                 {
+                    "source_id": "S1",
                     "source": "demo.txt",
                     "page": 1,
                     "chunk_index": 0,
@@ -38,6 +39,13 @@ class FakeRagService:
                     "excerpt": "demo excerpt",
                 }
             ],
+            "citation_verification": {
+                "grounded": True,
+                "all_citations_valid": True,
+                "cited_source_ids": ["S1"],
+                "missing_source_ids": [],
+                "unsupported_claims": [],
+            },
         }
 
     def list_documents(self):
@@ -139,6 +147,18 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(self.fake_service.chat_calls[-1].retrieval_mode, retrieval_mode)
             self.assertEqual(response.json()["sources"][0]["retrieval_unit"], retrieval_mode)
+
+    def test_chat_returns_source_ids_and_citation_verification(self):
+        response = self.client.post(
+            "/chat",
+            json={"question": "What is this about?", "retrieval_mode": "chunk"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["sources"][0]["source_id"], "S1")
+        self.assertEqual(payload["citation_verification"]["cited_source_ids"], ["S1"])
+        self.assertTrue(payload["citation_verification"]["grounded"])
 
     def test_list_documents_returns_active_document(self):
         response = self.client.get("/documents")

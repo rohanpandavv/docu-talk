@@ -30,6 +30,7 @@ class ChatRequest(BaseModel):
 
 
 class SourceSnippet(BaseModel):
+    source_id: str
     source: str
     page: int | None = None
     chunk_index: int | None = None
@@ -37,10 +38,25 @@ class SourceSnippet(BaseModel):
     excerpt: str
 
 
+class CitationIssue(BaseModel):
+    claim: str
+    cited_source_ids: list[str] = Field(default_factory=list)
+    reason: str
+
+
+class CitationVerification(BaseModel):
+    grounded: bool
+    all_citations_valid: bool
+    cited_source_ids: list[str] = Field(default_factory=list)
+    missing_source_ids: list[str] = Field(default_factory=list)
+    unsupported_claims: list[CitationIssue] = Field(default_factory=list)
+
+
 class ChatResponse(BaseModel):
     answer: str
     document_id: str
     sources: list[SourceSnippet]
+    citation_verification: CitationVerification | None = None
 
 
 class ChunkingStrategyOption(BaseModel):

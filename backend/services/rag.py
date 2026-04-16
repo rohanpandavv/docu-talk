@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
+import re
 from uuid import uuid4
 
 from chromadb.config import Settings as ChromaClientSettings
@@ -21,6 +23,8 @@ from schemas import (
     ChatRequest,
     ChatResponse,
     ChunkingStrategiesResponse,
+    CitationIssue,
+    CitationVerification,
     DEFAULT_RETRIEVAL_MODE,
     DocumentDeleteResponse,
     DocumentListResponse,
@@ -44,10 +48,16 @@ from services.errors import (
 from services.hybrid import bm25_scores, reciprocal_rank_fusion
 
 PROMPT_TEMPLATE = """You are answering questions about a user-uploaded document.
-Use only the provided context to answer the question.
+Use only the provided context blocks to answer the question.
+Every factual claim must include one or more inline citations using the exact source IDs from the context, like [S1] or [S1, S2].
+Never cite source IDs that are not listed in the valid source IDs.
 If the answer is not supported by the context, say that it is not present in the indexed document.
+Do not add a bibliography or separate source section.
 
-Context:
+Valid source IDs:
+{source_ids}
+
+Context blocks:
 {context}
 
 Question:
@@ -57,11 +67,32 @@ Question:
 CAG_SYSTEM_PROMPT = """You are answering questions about a user-uploaded document.
 The full document has been preloaded into context.
 Use only the provided document text to answer the question.
+Every factual claim must include one or more inline citations using the exact source IDs from the context, like [S1] or [S1, S2].
+Never cite source IDs that are not listed in the valid source IDs.
 If the answer is not supported by the document, say that it is not present in the indexed document.
+Do not add a bibliography or separate source section.
+"""
+
+GROUNDING_EVALUATOR_TEMPLATE = """You are verifying whether an answer is grounded in cited source excerpts from a user-uploaded document.
+Use only the provided answer and source excerpts.
+Treat factual claims without inline citations as unsupported unless the answer simply says the information is not present in the indexed document.
+Return valid JSON with exactly these keys:
+- "grounded": boolean
+- "unsupported_claims": array of objects with keys "claim", "cited_source_ids", and "reason"
+
+Valid source IDs:
+{source_ids}
+
+Answer:
+{answer}
+
+Source excerpts:
+{context}
 """
 
 HYBRID_VECTOR_CANDIDATE_MULTIPLIER = 4
 HYBRID_VECTOR_CANDIDATE_FLOOR = 10
+SOURCE_CITATION_PATTERN = re.compile(r"\[(S\d+(?:\s*,\s*S\d+)*)\]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,11 +100,18 @@ class RagQueryResult:
     answer: str
     document_id: str
     retrieved_documents: list[Document]
+    sources: list[SourceSnippet]
+    citation_verification: CitationVerification | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CitationContext:
+    labeled_context: str
+    sources: list[SourceSnippet]
 
 
 @dataclass(frozen=True, slots=True)
 class CagContext:
-    full_text: str
     page_documents: list[Document]
 
 
@@ -83,6 +121,9 @@ class RagService:
         self.logger = logging.getLogger("docutalk.rag")
         self.registry = DocumentRegistry(settings.documents_registry_path)
         self.prompt = PromptTemplate.from_template(PROMPT_TEMPLATE)
+        self.grounding_evaluator_prompt = PromptTemplate.from_template(
+            GROUNDING_EVALUATOR_TEMPLATE
+        )
         self._vectorstore: Chroma | None = None
         self._llm: ChatAnthropic | None = None
 
@@ -205,19 +246,30 @@ class RagService:
 
     def chat(self, request: ChatRequest) -> ChatResponse:
         result = self.answer_with_context(request)
-        sources = [self._build_source_snippet(doc) for doc in result.retrieved_documents]
 
         return ChatResponse(
             answer=result.answer,
             document_id=result.document_id,
-            sources=sources,
+            sources=result.sources,
+            citation_verification=result.citation_verification,
         )
 
     def answer_with_context(self, request: ChatRequest) -> RagQueryResult:
         document_id = self._resolve_document_id(request.document_id)
         if request.retrieval_mode == "cag":
             context = self._load_cag_context(document_id)
-            answer = self._generate_cag_answer(request.question, document_id, context.full_text)
+            citation_context = self._build_citation_context(context.page_documents)
+            if len(citation_context.labeled_context) > self.settings.cag_max_characters:
+                raise DocumentProcessingError(
+                    "This document is too large for CAG mode. Use chunk/page retrieval or raise the CAG limits."
+                )
+            answer = self._generate_cag_answer(request.question, document_id, citation_context)
+            citation_verification = self._evaluate_answer_citations(
+                question=request.question,
+                answer=answer,
+                document_id=document_id,
+                citation_context=citation_context,
+            )
 
             self.logger.info(
                 "Answered question against document %s using CAG over %s page(s)",
@@ -229,10 +281,19 @@ class RagService:
                 answer=answer,
                 document_id=document_id,
                 retrieved_documents=context.page_documents,
+                sources=citation_context.sources,
+                citation_verification=citation_verification,
             )
         if request.retrieval_mode == "hybrid":
             results = self._retrieve_hybrid_documents(request.question, document_id)
-            answer = self._generate_answer(request.question, document_id, results)
+            citation_context = self._build_citation_context(results)
+            answer = self._generate_answer(request.question, document_id, citation_context)
+            citation_verification = self._evaluate_answer_citations(
+                question=request.question,
+                answer=answer,
+                document_id=document_id,
+                citation_context=citation_context,
+            )
 
             self.logger.info(
                 "Answered question against document %s using hybrid retrieval with %s chunk(s)",
@@ -244,6 +305,8 @@ class RagService:
                 answer=answer,
                 document_id=document_id,
                 retrieved_documents=results,
+                sources=citation_context.sources,
+                citation_verification=citation_verification,
             )
 
         results = self._retrieve_documents(
@@ -251,7 +314,14 @@ class RagService:
             document_id,
             request.retrieval_mode,
         )
-        answer = self._generate_answer(request.question, document_id, results)
+        citation_context = self._build_citation_context(results)
+        answer = self._generate_answer(request.question, document_id, citation_context)
+        citation_verification = self._evaluate_answer_citations(
+            question=request.question,
+            answer=answer,
+            document_id=document_id,
+            citation_context=citation_context,
+        )
 
         self.logger.info(
             "Answered question against document %s using %s retrieved %s unit(s)",
@@ -264,6 +334,8 @@ class RagService:
             answer=answer,
             document_id=document_id,
             retrieved_documents=results,
+            sources=citation_context.sources,
+            citation_verification=citation_verification,
         )
 
     def list_documents(self) -> DocumentListResponse:
@@ -549,17 +621,18 @@ class RagService:
         self,
         question: str,
         document_id: str,
-        retrieved_documents: list[Document],
+        citation_context: CitationContext,
     ) -> str:
-        context = "\n\n".join(
-            doc.page_content for doc in retrieved_documents if doc.page_content.strip()
-        )
-        if not context:
+        if not citation_context.labeled_context.strip():
             raise DocumentProcessingError("The retrieved context was empty.")
 
         try:
-            response = (self.prompt | self._get_llm()).invoke(
-                {"context": context, "question": question}
+            response = self._invoke_answer_prompt(
+                {
+                    "context": citation_context.labeled_context,
+                    "question": question,
+                    "source_ids": self._format_valid_source_ids(citation_context.sources),
+                }
             )
         except ConfigurationError:
             raise
@@ -620,18 +693,17 @@ class RagService:
                 "This document is too large for CAG mode. Use chunk/page retrieval or raise the CAG limits."
             )
 
-        full_text = "\n\n".join(
-            self._format_page_for_cag(document)
+        total_characters = sum(
+            len(document.page_content)
             for document in page_documents
             if document.page_content.strip()
         )
-        if len(full_text) > self.settings.cag_max_characters:
+        if total_characters > self.settings.cag_max_characters:
             raise DocumentProcessingError(
                 "This document is too large for CAG mode. Use chunk/page retrieval or raise the CAG limits."
             )
 
         return CagContext(
-            full_text=full_text,
             page_documents=page_documents,
         )
 
@@ -639,9 +711,13 @@ class RagService:
         self,
         question: str,
         document_id: str,
-        full_text: str,
+        citation_context: CitationContext,
     ) -> str:
-        cached_messages = self._build_cag_messages(question, full_text, use_prompt_cache=True)
+        cached_messages = self._build_cag_messages(
+            question,
+            citation_context,
+            use_prompt_cache=True,
+        )
 
         try:
             response = self._invoke_cag_model(cached_messages)
@@ -655,7 +731,7 @@ class RagService:
             )
             uncached_messages = self._build_cag_messages(
                 question,
-                full_text,
+                citation_context,
                 use_prompt_cache=False,
             )
             try:
@@ -673,13 +749,18 @@ class RagService:
     def _build_cag_messages(
         self,
         question: str,
-        full_text: str,
+        citation_context: CitationContext,
         *,
         use_prompt_cache: bool,
     ) -> list[SystemMessage | HumanMessage]:
         document_block: dict[str, object] = {
             "type": "text",
-            "text": f"Document context:\n{full_text}",
+            "text": (
+                "Valid source IDs:\n"
+                f"{self._format_valid_source_ids(citation_context.sources)}\n\n"
+                "Document context:\n"
+                f"{citation_context.labeled_context}"
+            ),
         }
         if use_prompt_cache:
             document_block["cache_control"] = {
@@ -696,11 +777,168 @@ class RagService:
     def _invoke_cag_model(self, messages: list[SystemMessage | HumanMessage]) -> object:
         return self._get_llm().invoke(messages)
 
-    def _format_page_for_cag(self, document: Document) -> str:
-        page_number = (document.metadata or {}).get("page")
-        if page_number is None:
-            return document.page_content
-        return f"[Page {page_number}]\n{document.page_content}"
+    def _invoke_answer_prompt(self, prompt_input: dict[str, str]) -> object:
+        return (self.prompt | self._get_llm()).invoke(prompt_input)
+
+    def _invoke_grounding_evaluator(self, prompt_input: dict[str, str]) -> object:
+        return (self.grounding_evaluator_prompt | self._get_llm()).invoke(prompt_input)
+
+    def _build_citation_context(self, documents: list[Document]) -> CitationContext:
+        sources: list[SourceSnippet] = []
+        blocks: list[str] = []
+
+        for document in documents:
+            page_content = document.page_content.strip()
+            if not page_content:
+                continue
+
+            source = self._build_source_snippet(document, source_id=f"S{len(sources) + 1}")
+            sources.append(source)
+            blocks.append(self._format_context_block(source, page_content))
+
+        return CitationContext(
+            labeled_context="\n\n".join(blocks),
+            sources=sources,
+        )
+
+    def _format_context_block(self, source: SourceSnippet, page_content: str) -> str:
+        header_parts = [f"[{source.source_id}]", source.source]
+        if source.page is not None:
+            header_parts.append(f"page {source.page}")
+        if source.chunk_index is not None:
+            header_parts.append(f"chunk {source.chunk_index}")
+        header_parts.append(f"unit {source.retrieval_unit}")
+        return f"{' | '.join(header_parts)}\n{page_content}"
+
+    def _format_valid_source_ids(self, sources: list[SourceSnippet]) -> str:
+        return ", ".join(source.source_id for source in sources)
+
+    def _evaluate_answer_citations(
+        self,
+        *,
+        question: str,
+        answer: str,
+        document_id: str,
+        citation_context: CitationContext,
+    ) -> CitationVerification:
+        cited_source_ids = self._extract_cited_source_ids(answer)
+        valid_source_ids = {source.source_id for source in citation_context.sources}
+        missing_source_ids = [
+            source_id
+            for source_id in cited_source_ids
+            if source_id not in valid_source_ids
+        ]
+        unsupported_claims: list[CitationIssue] = []
+
+        if missing_source_ids:
+            unsupported_claims.append(
+                CitationIssue(
+                    claim="The answer cites source IDs that are not present in the retrieved context.",
+                    cited_source_ids=missing_source_ids,
+                    reason="Only cite source IDs that appear in the source list for this response.",
+                )
+            )
+
+        if not cited_source_ids and not self._is_abstention_answer(answer):
+            unsupported_claims.append(
+                CitationIssue(
+                    claim="The answer does not include inline citations.",
+                    cited_source_ids=[],
+                    reason="Each factual claim should cite one or more retrieved source IDs.",
+                )
+            )
+
+        evaluator_grounded: bool | None = None
+        try:
+            evaluator_grounded, evaluator_issues = self._run_grounding_evaluator(
+                question=question,
+                answer=answer,
+                citation_context=citation_context,
+            )
+            unsupported_claims.extend(evaluator_issues)
+        except ConfigurationError:
+            raise
+        except Exception as exc:
+            self.logger.warning(
+                "Grounding evaluator failed for %s; returning deterministic citation checks only.",
+                document_id,
+                exc_info=exc,
+            )
+
+        grounded = not unsupported_claims
+        if evaluator_grounded is not None:
+            grounded = grounded and evaluator_grounded
+
+        return CitationVerification(
+            grounded=grounded,
+            all_citations_valid=not missing_source_ids,
+            cited_source_ids=cited_source_ids,
+            missing_source_ids=missing_source_ids,
+            unsupported_claims=unsupported_claims,
+        )
+
+    def _run_grounding_evaluator(
+        self,
+        *,
+        question: str,
+        answer: str,
+        citation_context: CitationContext,
+    ) -> tuple[bool | None, list[CitationIssue]]:
+        if not citation_context.sources:
+            return None, []
+
+        response = self._invoke_grounding_evaluator(
+            {
+                "source_ids": self._format_valid_source_ids(citation_context.sources),
+                "answer": f"Question:\n{question}\n\nAnswer:\n{answer}",
+                "context": citation_context.labeled_context,
+            }
+        )
+        payload = self._parse_grounding_evaluator_payload(response.content)
+
+        issues: list[CitationIssue] = []
+        for raw_issue in payload.get("unsupported_claims", []):
+            if not isinstance(raw_issue, dict):
+                continue
+            cited_source_ids = [
+                str(source_id)
+                for source_id in raw_issue.get("cited_source_ids", [])
+                if source_id
+            ]
+            issues.append(
+                CitationIssue(
+                    claim=str(raw_issue.get("claim", "")).strip() or "Unsupported claim",
+                    cited_source_ids=cited_source_ids,
+                    reason=str(raw_issue.get("reason", "")).strip()
+                    or "The cited sources do not fully support this claim.",
+                )
+            )
+
+        grounded_value = payload.get("grounded")
+        grounded = bool(grounded_value) if isinstance(grounded_value, bool) else None
+        return grounded, issues
+
+    def _parse_grounding_evaluator_payload(self, content: object) -> dict[str, object]:
+        normalized_content = self._normalize_answer_content(content).strip()
+        json_start = normalized_content.find("{")
+        json_end = normalized_content.rfind("}")
+        if json_start != -1 and json_end != -1 and json_end >= json_start:
+            normalized_content = normalized_content[json_start : json_end + 1]
+        return json.loads(normalized_content)
+
+    def _extract_cited_source_ids(self, answer: str) -> list[str]:
+        cited_source_ids: list[str] = []
+
+        for citation_group in SOURCE_CITATION_PATTERN.findall(answer):
+            for raw_source_id in citation_group.split(","):
+                source_id = raw_source_id.strip()
+                if source_id and source_id not in cited_source_ids:
+                    cited_source_ids.append(source_id)
+
+        return cited_source_ids
+
+    def _is_abstention_answer(self, answer: str) -> bool:
+        return "not present in the indexed document" in answer.lower()
 
     def _extract_documents(
         self,
@@ -848,13 +1086,14 @@ class RagService:
 
         return self._llm
 
-    def _build_source_snippet(self, document: Document) -> SourceSnippet:
+    def _build_source_snippet(self, document: Document, *, source_id: str) -> SourceSnippet:
         excerpt = document.page_content.strip()
         if len(excerpt) > 280:
             excerpt = f"{excerpt[:277].rstrip()}..."
 
         metadata = document.metadata or {}
         return SourceSnippet(
+            source_id=source_id,
             source=str(metadata.get("source", "document")),
             page=metadata.get("page"),
             chunk_index=(

@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -68,25 +69,32 @@ class TestableRagService(RagService):
     def __init__(self, settings, vectorstore):
         super().__init__(settings)
         self._test_vectorstore = vectorstore
-        self.generated_answers = []
+        self.answer_prompt_inputs = []
         self.cag_messages = []
+        self.evaluator_prompt_inputs = []
+        self.answer_content = "Answer using retrieved context [S1]"
+        self.cag_answer_content = "Answer using full-document context [S1]"
+        self.evaluator_content = json.dumps(
+            {
+                "grounded": True,
+                "unsupported_claims": [],
+            }
+        )
 
     def _get_vectorstore(self):
         return self._test_vectorstore
 
-    def _generate_answer(self, question, document_id, retrieved_documents):
-        self.generated_answers.append(
-            {
-                "question": question,
-                "document_id": document_id,
-                "retrieved_documents": retrieved_documents,
-            }
-        )
-        return f"Answer using {len(retrieved_documents)} retrieved unit(s)"
+    def _invoke_answer_prompt(self, prompt_input):
+        self.answer_prompt_inputs.append(prompt_input)
+        return SimpleNamespace(content=self.answer_content)
 
     def _invoke_cag_model(self, messages):
         self.cag_messages.append(messages)
-        return SimpleNamespace(content="Answer using full-document context")
+        return SimpleNamespace(content=self.cag_answer_content)
+
+    def _invoke_grounding_evaluator(self, prompt_input):
+        self.evaluator_prompt_inputs.append(prompt_input)
+        return SimpleNamespace(content=self.evaluator_content)
 
 
 class RagServiceTests(unittest.TestCase):
@@ -178,8 +186,16 @@ class RagServiceTests(unittest.TestCase):
                 ]
             },
         )
+        self.assertEqual(response.answer, "Answer using retrieved context [S1]")
+        self.assertEqual(response.sources[0].source_id, "S1")
         self.assertEqual(response.sources[0].retrieval_unit, "page")
         self.assertIsNone(response.sources[0].chunk_index)
+        self.assertTrue(response.citation_verification.grounded)
+        self.assertEqual(
+            self.service.answer_prompt_inputs[0]["source_ids"],
+            "S1",
+        )
+        self.assertIn("[S1] | demo.txt | page 1 | unit page", self.service.answer_prompt_inputs[0]["context"])
 
     def test_chunk_retrieval_falls_back_to_legacy_documents(self):
         self.service.registry.add_document(
@@ -282,12 +298,17 @@ class RagServiceTests(unittest.TestCase):
                 ]
             },
         )
-        self.assertEqual(response.answer, "Answer using full-document context")
+        self.assertEqual(response.answer, "Answer using full-document context [S1]")
+        self.assertEqual([source.source_id for source in response.sources], ["S1", "S2"])
         self.assertEqual([source.page for source in response.sources], [1, 2])
         self.assertEqual([source.retrieval_unit for source in response.sources], ["cag", "cag"])
         self.assertEqual(
             self.cag_document_text(),
-            "Document context:\n[Page 1]\nFirst page context\n\n[Page 2]\nSecond page context",
+            (
+                "Valid source IDs:\nS1, S2\n\nDocument context:\n"
+                "[S1] | demo.txt | page 1 | unit cag\nFirst page context\n\n"
+                "[S2] | demo.txt | page 2 | unit cag\nSecond page context"
+            ),
         )
         self.assertEqual(
             self.service.cag_messages[0][1].content[0]["cache_control"],
@@ -393,6 +414,7 @@ class RagServiceTests(unittest.TestCase):
             )
         )
 
+        self.assertEqual(response.sources[0].source_id, "S1")
         self.assertEqual(response.sources[0].chunk_index, 2)
         self.assertEqual(
             self.vectorstore.search_with_score_calls[0]["filter"],
@@ -460,6 +482,101 @@ class RagServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(response.sources[0].chunk_index, 1)
+        self.assertEqual(response.sources[0].source_id, "S1")
+
+    def test_citation_verification_flags_unknown_source_ids(self):
+        upload = self.service.ingest_document(
+            filename="demo.txt",
+            content_type="text/plain",
+            content=b"One short page of text.",
+        )
+        page_filter = (
+            "$and",
+            (
+                (("document_id", upload.document_id),),
+                (("retrieval_unit", "page"),),
+            ),
+        )
+        self.vectorstore.search_results[page_filter] = [
+            Document(
+                page_content="Supported page context",
+                metadata={
+                    "source": "demo.txt",
+                    "page": 1,
+                    "retrieval_unit": "page",
+                },
+            )
+        ]
+        self.service.answer_content = "This cites a missing source [S9]."
+
+        response = self.service.chat(
+            ChatRequest(
+                question="What is supported?",
+                document_id=upload.document_id,
+                retrieval_mode="page",
+            )
+        )
+
+        self.assertFalse(response.citation_verification.grounded)
+        self.assertFalse(response.citation_verification.all_citations_valid)
+        self.assertEqual(response.citation_verification.cited_source_ids, ["S9"])
+        self.assertEqual(response.citation_verification.missing_source_ids, ["S9"])
+
+    def test_citation_verification_surfaces_unsupported_claims(self):
+        upload = self.service.ingest_document(
+            filename="demo.txt",
+            content_type="text/plain",
+            content=b"One short page of text.",
+        )
+        page_filter = (
+            "$and",
+            (
+                (("document_id", upload.document_id),),
+                (("retrieval_unit", "page"),),
+            ),
+        )
+        self.vectorstore.search_results[page_filter] = [
+            Document(
+                page_content="The document describes a pilot study but gives no accuracy figure.",
+                metadata={
+                    "source": "demo.txt",
+                    "page": 1,
+                    "retrieval_unit": "page",
+                },
+            )
+        ]
+        self.service.answer_content = "The paper reports 90% accuracy [S1]."
+        self.service.evaluator_content = json.dumps(
+            {
+                "grounded": False,
+                "unsupported_claims": [
+                    {
+                        "claim": "The paper reports 90% accuracy",
+                        "cited_source_ids": ["S1"],
+                        "reason": "Source S1 does not mention an accuracy figure.",
+                    }
+                ],
+            }
+        )
+
+        response = self.service.chat(
+            ChatRequest(
+                question="What accuracy does it report?",
+                document_id=upload.document_id,
+                retrieval_mode="page",
+            )
+        )
+
+        self.assertFalse(response.citation_verification.grounded)
+        self.assertEqual(len(response.citation_verification.unsupported_claims), 1)
+        self.assertEqual(
+            response.citation_verification.unsupported_claims[0].cited_source_ids,
+            ["S1"],
+        )
+        self.assertIn(
+            "Question:\nWhat accuracy does it report?",
+            self.service.evaluator_prompt_inputs[0]["answer"],
+        )
 
     def test_cag_requires_page_indexes(self):
         self.service.registry.add_document(
