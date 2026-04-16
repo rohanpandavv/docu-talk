@@ -41,6 +41,7 @@ from services.errors import (
     NoActiveDocumentError,
     UpstreamServiceError,
 )
+from services.hybrid import bm25_scores, reciprocal_rank_fusion
 
 PROMPT_TEMPLATE = """You are answering questions about a user-uploaded document.
 Use only the provided context to answer the question.
@@ -58,6 +59,9 @@ The full document has been preloaded into context.
 Use only the provided document text to answer the question.
 If the answer is not supported by the document, say that it is not present in the indexed document.
 """
+
+HYBRID_VECTOR_CANDIDATE_MULTIPLIER = 4
+HYBRID_VECTOR_CANDIDATE_FLOOR = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +230,21 @@ class RagService:
                 document_id=document_id,
                 retrieved_documents=context.page_documents,
             )
+        if request.retrieval_mode == "hybrid":
+            results = self._retrieve_hybrid_documents(request.question, document_id)
+            answer = self._generate_answer(request.question, document_id, results)
+
+            self.logger.info(
+                "Answered question against document %s using hybrid retrieval with %s chunk(s)",
+                document_id,
+                len(results),
+            )
+
+            return RagQueryResult(
+                answer=answer,
+                document_id=document_id,
+                retrieved_documents=results,
+            )
 
         results = self._retrieve_documents(
             request.question,
@@ -345,6 +364,186 @@ class RagService:
             )
 
         return results
+
+    def _retrieve_hybrid_documents(self, question: str, document_id: str) -> list[Document]:
+        chunk_documents = self._load_chunk_documents(document_id)
+        if not chunk_documents:
+            raise DocumentProcessingError(
+                "No indexed chunks were found for the requested document."
+            )
+
+        candidate_count = min(
+            len(chunk_documents),
+            max(self.settings.retrieve_k * HYBRID_VECTOR_CANDIDATE_MULTIPLIER, HYBRID_VECTOR_CANDIDATE_FLOOR),
+        )
+        vector_candidates = self._load_hybrid_vector_candidates(
+            question,
+            document_id,
+            candidate_count,
+        )
+
+        lexical_scores = bm25_scores(
+            question,
+            [document.page_content for document in chunk_documents.values()],
+        )
+        lexical_ranking = [
+            candidate_id
+            for candidate_id, score in sorted(
+                zip(chunk_documents.keys(), lexical_scores, strict=False),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            if score > 0
+        ]
+        vector_ranking = [candidate_id for candidate_id, _ in vector_candidates]
+
+        fused_scores = reciprocal_rank_fusion([vector_ranking, lexical_ranking])
+        if not fused_scores:
+            return [document for _, document in vector_candidates[: self.settings.retrieve_k]]
+
+        ranked_candidate_ids = [
+            candidate_id
+            for candidate_id, _ in sorted(
+                fused_scores.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+        ]
+
+        results: list[Document] = []
+        for candidate_id in ranked_candidate_ids:
+            document = chunk_documents.get(candidate_id)
+            if document is None:
+                continue
+            results.append(document)
+            if len(results) == self.settings.retrieve_k:
+                break
+
+        if results:
+            return results
+
+        return [document for _, document in vector_candidates[: self.settings.retrieve_k]]
+
+    def _load_chunk_documents(self, document_id: str) -> dict[str, Document]:
+        primary_filter = {
+            "$and": [
+                {"document_id": document_id},
+                {"retrieval_unit": "chunk"},
+            ]
+        }
+        stored = self._load_stored_documents(
+            document_id=document_id,
+            primary_filter=primary_filter,
+            legacy_error_message="No indexed chunks were found for the requested document.",
+        )
+
+        chunk_documents: dict[str, Document] = {}
+        for text, metadata in zip(
+            stored.get("documents") or [],
+            stored.get("metadatas") or [],
+            strict=False,
+        ):
+            if not isinstance(text, str) or not text.strip():
+                continue
+            document = Document(page_content=text, metadata=dict(metadata or {}))
+            chunk_documents[self._hybrid_candidate_key(document)] = document
+
+        return chunk_documents
+
+    def _load_hybrid_vector_candidates(
+        self,
+        question: str,
+        document_id: str,
+        candidate_count: int,
+    ) -> list[tuple[str, Document]]:
+        primary_filter = {
+            "$and": [
+                {"document_id": document_id},
+                {"retrieval_unit": "chunk"},
+            ]
+        }
+
+        try:
+            scored_results = self._get_vectorstore().similarity_search_with_score(
+                question,
+                k=candidate_count,
+                filter=primary_filter,
+            )
+        except ConfigurationError:
+            raise
+        except Exception as exc:
+            raise UpstreamServiceError("Failed to retrieve document context.") from exc
+
+        if not scored_results:
+            self.logger.info(
+                "No hybrid chunk-tagged records found for %s. Falling back to legacy chunk retrieval.",
+                document_id,
+            )
+            try:
+                scored_results = self._get_vectorstore().similarity_search_with_score(
+                    question,
+                    k=candidate_count,
+                    filter={"document_id": document_id},
+                )
+            except ConfigurationError:
+                raise
+            except Exception as exc:
+                raise UpstreamServiceError("Failed to retrieve document context.") from exc
+
+        return [
+            (self._hybrid_candidate_key(document), document)
+            for document, _ in scored_results
+        ]
+
+    def _load_stored_documents(
+        self,
+        *,
+        document_id: str,
+        primary_filter: dict[str, object],
+        legacy_error_message: str,
+    ) -> dict[str, object]:
+        try:
+            stored = self._get_vectorstore().get(
+                where=primary_filter,
+                include=["documents", "metadatas"],
+            )
+        except ConfigurationError:
+            raise
+        except Exception as exc:
+            raise UpstreamServiceError("Failed to load indexed document content.") from exc
+
+        if stored.get("documents"):
+            return stored
+
+        self.logger.info(
+            "No tagged records found for %s. Falling back to legacy stored chunks.",
+            document_id,
+        )
+        try:
+            legacy_stored = self._get_vectorstore().get(
+                where={"document_id": document_id},
+                include=["documents", "metadatas"],
+            )
+        except ConfigurationError:
+            raise
+        except Exception as exc:
+            raise UpstreamServiceError("Failed to load indexed document content.") from exc
+
+        if not legacy_stored.get("documents"):
+            raise DocumentProcessingError(legacy_error_message)
+
+        return legacy_stored
+
+    def _hybrid_candidate_key(self, document: Document) -> str:
+        metadata = document.metadata or {}
+        return "|".join(
+            [
+                str(metadata.get("document_id", "")),
+                str(metadata.get("source", "")),
+                str(metadata.get("page", "")),
+                str(metadata.get("chunk_index", "")),
+            ]
+        )
 
     def _generate_answer(
         self,

@@ -16,6 +16,8 @@ class FakeVectorStore:
         self.add_calls = []
         self.search_calls = []
         self.search_results = {}
+        self.search_with_score_calls = []
+        self.search_with_score_results = {}
         self.get_calls = []
         self.get_results = {}
 
@@ -31,6 +33,10 @@ class FakeVectorStore:
     def similarity_search(self, query, k, filter):
         self.search_calls.append({"query": query, "k": k, "filter": filter})
         return self.search_results.get(self._normalize_filter(filter), [])
+
+    def similarity_search_with_score(self, query, k, filter):
+        self.search_with_score_calls.append({"query": query, "k": k, "filter": filter})
+        return self.search_with_score_results.get(self._normalize_filter(filter), [])
 
     def get(self, where, include):
         self.get_calls.append({"where": where, "include": include})
@@ -287,6 +293,173 @@ class RagServiceTests(unittest.TestCase):
             self.service.cag_messages[0][1].content[0]["cache_control"],
             {"type": "ephemeral", "ttl": "5m"},
         )
+
+    def test_hybrid_mode_combines_vector_and_lexical_signals(self):
+        self.service.registry.add_document(
+            document_id="doc-hybrid",
+            filename="demo.txt",
+            content_type="text/plain",
+            page_count=1,
+            chunk_count=3,
+            chunking_strategy="research_paper",
+            chunk_size=1000,
+            chunk_overlap=200,
+        )
+        hybrid_filter = (
+            "$and",
+            (
+                (("document_id", "doc-hybrid"),),
+                (("retrieval_unit", "chunk"),),
+            ),
+        )
+        self.vectorstore.get_results[hybrid_filter] = {
+            "ids": ["chunk-0", "chunk-1", "chunk-2"],
+            "documents": [
+                "Transformer overview and architecture notes",
+                "BM25 keyword matching with sparse retrieval",
+                "Hybrid retrieval combines BM25 with dense vector search",
+            ],
+            "metadatas": [
+                {
+                    "document_id": "doc-hybrid",
+                    "source": "demo.txt",
+                    "page": 1,
+                    "chunk_index": 0,
+                    "retrieval_unit": "chunk",
+                },
+                {
+                    "document_id": "doc-hybrid",
+                    "source": "demo.txt",
+                    "page": 1,
+                    "chunk_index": 1,
+                    "retrieval_unit": "chunk",
+                },
+                {
+                    "document_id": "doc-hybrid",
+                    "source": "demo.txt",
+                    "page": 1,
+                    "chunk_index": 2,
+                    "retrieval_unit": "chunk",
+                },
+            ],
+        }
+        self.vectorstore.search_with_score_results[hybrid_filter] = [
+            (
+                Document(
+                    page_content="Transformer overview and architecture notes",
+                    metadata={
+                        "document_id": "doc-hybrid",
+                        "source": "demo.txt",
+                        "page": 1,
+                        "chunk_index": 0,
+                        "retrieval_unit": "chunk",
+                    },
+                ),
+                0.10,
+            ),
+            (
+                Document(
+                    page_content="Hybrid retrieval combines BM25 with dense vector search",
+                    metadata={
+                        "document_id": "doc-hybrid",
+                        "source": "demo.txt",
+                        "page": 1,
+                        "chunk_index": 2,
+                        "retrieval_unit": "chunk",
+                    },
+                ),
+                0.20,
+            ),
+            (
+                Document(
+                    page_content="BM25 keyword matching with sparse retrieval",
+                    metadata={
+                        "document_id": "doc-hybrid",
+                        "source": "demo.txt",
+                        "page": 1,
+                        "chunk_index": 1,
+                        "retrieval_unit": "chunk",
+                    },
+                ),
+                0.30,
+            ),
+        ]
+
+        response = self.service.chat(
+            ChatRequest(
+                question="bm25 hybrid retrieval",
+                document_id="doc-hybrid",
+                retrieval_mode="hybrid",
+            )
+        )
+
+        self.assertEqual(response.sources[0].chunk_index, 2)
+        self.assertEqual(
+            self.vectorstore.search_with_score_calls[0]["filter"],
+            {
+                "$and": [
+                    {"document_id": "doc-hybrid"},
+                    {"retrieval_unit": "chunk"},
+                ]
+            },
+        )
+
+    def test_hybrid_mode_falls_back_to_legacy_chunk_records(self):
+        self.service.registry.add_document(
+            document_id="doc-legacy",
+            filename="legacy.txt",
+            content_type="text/plain",
+            page_count=1,
+            chunk_count=2,
+            chunking_strategy="research_paper",
+            chunk_size=1000,
+            chunk_overlap=200,
+        )
+        self.vectorstore.get_results[(("document_id", "doc-legacy"),)] = {
+            "ids": ["legacy-0", "legacy-1"],
+            "documents": [
+                "Legacy dense retrieval chunk",
+                "Legacy BM25 chunk with keyword hits",
+            ],
+            "metadatas": [
+                {
+                    "document_id": "doc-legacy",
+                    "source": "legacy.txt",
+                    "page": 1,
+                    "chunk_index": 0,
+                },
+                {
+                    "document_id": "doc-legacy",
+                    "source": "legacy.txt",
+                    "page": 1,
+                    "chunk_index": 1,
+                },
+            ],
+        }
+        self.vectorstore.search_with_score_results[(("document_id", "doc-legacy"),)] = [
+            (
+                Document(
+                    page_content="Legacy BM25 chunk with keyword hits",
+                    metadata={
+                        "document_id": "doc-legacy",
+                        "source": "legacy.txt",
+                        "page": 1,
+                        "chunk_index": 1,
+                    },
+                ),
+                0.2,
+            )
+        ]
+
+        response = self.service.chat(
+            ChatRequest(
+                question="keyword hits",
+                document_id="doc-legacy",
+                retrieval_mode="hybrid",
+            )
+        )
+
+        self.assertEqual(response.sources[0].chunk_index, 1)
 
     def test_cag_requires_page_indexes(self):
         self.service.registry.add_document(

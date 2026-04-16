@@ -130,7 +130,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
 
     def test_chat_accepts_non_default_retrieval_modes(self):
-        for retrieval_mode in ("page", "cag"):
+        for retrieval_mode in ("page", "cag", "hybrid"):
             response = self.client.post(
                 "/chat",
                 json={"question": "What is this about?", "retrieval_mode": retrieval_mode},

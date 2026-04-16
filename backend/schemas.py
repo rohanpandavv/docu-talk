@@ -3,7 +3,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field, field_validator
 
 DEFAULT_RETRIEVAL_MODE = "chunk"
-SUPPORTED_RETRIEVAL_MODES = {"cag", "chunk", "page"}
+SUPPORTED_RETRIEVAL_MODES = {"cag", "chunk", "hybrid", "page"}
 
 
 class ChatRequest(BaseModel):
