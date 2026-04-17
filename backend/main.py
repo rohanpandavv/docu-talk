@@ -11,6 +11,7 @@ from schemas import (
     DocumentDeleteResponse,
     DocumentListResponse,
     DocumentSummary,
+    ObservabilityResponse,
     UploadResponse,
 )
 from services.errors import (
@@ -21,6 +22,7 @@ from services.errors import (
     ServiceError,
     UpstreamServiceError,
 )
+from services.observability import ObservabilityService, get_observability_service
 from services.rag import RagService, get_rag_service
 
 
@@ -76,6 +78,12 @@ def create_app() -> FastAPI:
     @app.post("/chat", response_model=ChatResponse)
     def chat(request: ChatRequest, rag_service: RagService = Depends(get_rag_service)):
         return rag_service.chat(request)
+
+    @app.get("/observability", response_model=ObservabilityResponse)
+    def observability(
+        observability_service: ObservabilityService = Depends(get_observability_service),
+    ):
+        return observability_service.snapshot()
 
     return app
 

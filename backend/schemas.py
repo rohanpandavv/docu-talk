@@ -59,6 +59,36 @@ class ChatResponse(BaseModel):
     citation_verification: CitationVerification | None = None
 
 
+class ObservabilityRecord(BaseModel):
+    request_id: str
+    timestamp: datetime
+    retrieval_mode: str
+    document_id: str | None = None
+    success: bool
+    error_type: str | None = None
+    total_latency_ms: float
+    retrieval_latency_ms: float | None = None
+    generation_latency_ms: float | None = None
+    estimated_cost_usd: float
+
+
+class ObservabilitySummary(BaseModel):
+    total_requests: int
+    successful_requests: int
+    failed_requests: int
+    failure_rate: float
+    latency_p50_ms: float | None = None
+    latency_p95_ms: float | None = None
+    average_cost_usd: float
+    total_cost_usd: float
+
+
+class ObservabilityResponse(BaseModel):
+    summary: ObservabilitySummary
+    recent_requests: list[ObservabilityRecord] = Field(default_factory=list)
+    cost_estimation_strategy: str
+
+
 class ChunkingStrategyOption(BaseModel):
     key: str
     label: str

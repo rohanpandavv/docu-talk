@@ -3,6 +3,7 @@ import unittest
 from fastapi.testclient import TestClient
 
 from main import app
+from services.observability import get_observability_service
 from services.rag import get_rag_service
 
 
@@ -109,10 +110,46 @@ class FakeRagService:
         }
 
 
+class FakeObservabilityService:
+    def snapshot(self):
+        return {
+            "summary": {
+                "total_requests": 4,
+                "successful_requests": 3,
+                "failed_requests": 1,
+                "failure_rate": 0.25,
+                "latency_p50_ms": 120.0,
+                "latency_p95_ms": 210.0,
+                "average_cost_usd": 0.00125,
+                "total_cost_usd": 0.005,
+            },
+            "recent_requests": [
+                {
+                    "request_id": "req-123",
+                    "timestamp": "2026-04-18T00:00:00+00:00",
+                    "retrieval_mode": "chunk",
+                    "document_id": "doc-123",
+                    "success": True,
+                    "error_type": None,
+                    "total_latency_ms": 110.0,
+                    "retrieval_latency_ms": 25.0,
+                    "generation_latency_ms": 85.0,
+                    "estimated_cost_usd": 0.001,
+                }
+            ],
+            "cost_estimation_strategy": (
+                "Prefers provider-reported cost when available; otherwise estimates USD "
+                "from token usage and hardcoded per-model pricing constants."
+            ),
+        }
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self):
         self.fake_service = FakeRagService()
+        self.fake_observability = FakeObservabilityService()
         app.dependency_overrides[get_rag_service] = lambda: self.fake_service
+        app.dependency_overrides[get_observability_service] = lambda: self.fake_observability
         self.client = TestClient(app)
 
     def tearDown(self):
@@ -181,3 +218,14 @@ class ApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["default_strategy"], "research_paper")
         self.assertEqual(payload["strategies"][0]["key"], "research_paper")
+
+    def test_observability_returns_aggregate_metrics(self):
+        response = self.client.get("/observability")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["summary"]["total_requests"], 4)
+        self.assertEqual(payload["summary"]["failure_rate"], 0.25)
+        self.assertEqual(payload["summary"]["latency_p95_ms"], 210.0)
+        self.assertEqual(payload["recent_requests"][0]["request_id"], "req-123")
+        self.assertEqual(payload["recent_requests"][0]["retrieval_mode"], "chunk")

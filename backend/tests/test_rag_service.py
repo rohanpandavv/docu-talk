@@ -8,7 +8,8 @@ from langchain_core.documents import Document
 
 from config import Settings
 from schemas import ChatRequest
-from services.errors import DocumentProcessingError
+from services.errors import DocumentNotFoundError, DocumentProcessingError
+from services.observability import ObservabilityService
 from services.rag import RagService
 
 
@@ -66,8 +67,8 @@ class FakeVectorStore:
 
 
 class TestableRagService(RagService):
-    def __init__(self, settings, vectorstore):
-        super().__init__(settings)
+    def __init__(self, settings, vectorstore, observability=None):
+        super().__init__(settings, observability=observability)
         self._test_vectorstore = vectorstore
         self.answer_prompt_inputs = []
         self.cag_messages = []
@@ -123,7 +124,12 @@ class RagServiceTests(unittest.TestCase):
             anthropic_prompt_cache_ttl="5m",
         )
         self.vectorstore = FakeVectorStore()
-        self.service = TestableRagService(self.settings, self.vectorstore)
+        self.observability = ObservabilityService(recent_requests_limit=10)
+        self.service = TestableRagService(
+            self.settings,
+            self.vectorstore,
+            observability=self.observability,
+        )
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -196,6 +202,31 @@ class RagServiceTests(unittest.TestCase):
             "S1",
         )
         self.assertIn("[S1] | demo.txt | page 1 | unit page", self.service.answer_prompt_inputs[0]["context"])
+
+        snapshot = self.observability.snapshot()
+        self.assertEqual(snapshot.summary.total_requests, 1)
+        self.assertEqual(snapshot.summary.successful_requests, 1)
+        self.assertEqual(snapshot.recent_requests[0].retrieval_mode, "page")
+        self.assertEqual(snapshot.recent_requests[0].document_id, upload.document_id)
+        self.assertTrue(snapshot.recent_requests[0].success)
+        self.assertIsNotNone(snapshot.recent_requests[0].retrieval_latency_ms)
+        self.assertIsNotNone(snapshot.recent_requests[0].generation_latency_ms)
+
+    def test_chat_records_failed_request_observability(self):
+        with self.assertRaises(DocumentNotFoundError):
+            self.service.chat(
+                ChatRequest(
+                    question="What is this about?",
+                    document_id="missing-doc",
+                    retrieval_mode="chunk",
+                )
+            )
+
+        snapshot = self.observability.snapshot()
+        self.assertEqual(snapshot.summary.total_requests, 1)
+        self.assertEqual(snapshot.summary.failed_requests, 1)
+        self.assertFalse(snapshot.recent_requests[0].success)
+        self.assertEqual(snapshot.recent_requests[0].error_type, "DocumentNotFoundError")
 
     def test_summary_questions_expand_chunk_context_with_summary_supporting_chunks(self):
         self.service.registry.add_document(

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import logging
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 import re
+from time import perf_counter
 from uuid import uuid4
 
 from chromadb.config import Settings as ChromaClientSettings
@@ -46,6 +48,11 @@ from services.errors import (
     UpstreamServiceError,
 )
 from services.hybrid import bm25_scores, reciprocal_rank_fusion
+from services.observability import (
+    ObservabilityService,
+    RequestCostTracker,
+    get_observability_service,
+)
 
 PROMPT_TEMPLATE = """You are answering questions about a user-uploaded document.
 Use only the provided context blocks to answer the question.
@@ -146,7 +153,11 @@ class CagContext:
 
 
 class RagService:
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        observability: ObservabilityService | None = None,
+    ):
         self.settings = settings
         self.logger = logging.getLogger("docutalk.rag")
         self.registry = DocumentRegistry(settings.documents_registry_path)
@@ -154,6 +165,7 @@ class RagService:
         self.grounding_evaluator_prompt = PromptTemplate.from_template(
             GROUNDING_EVALUATOR_TEMPLATE
         )
+        self.observability = observability or get_observability_service()
         self._vectorstore: Chroma | None = None
         self._llm: ChatAnthropic | None = None
 
@@ -285,100 +297,177 @@ class RagService:
         )
 
     def answer_with_context(self, request: ChatRequest) -> RagQueryResult:
-        document_id = self._resolve_document_id(request.document_id)
-        if request.retrieval_mode == "cag":
-            context = self._load_cag_context(document_id)
-            citation_context = self._build_citation_context(context.page_documents)
-            if len(citation_context.labeled_context) > self.settings.cag_max_characters:
-                raise DocumentProcessingError(
-                    "This document is too large for CAG mode. Use chunk/page retrieval or raise the CAG limits."
+        request_id = str(uuid4())
+        request_timestamp = datetime.now(timezone.utc)
+        request_started_at = perf_counter()
+        retrieval_started_at = request_started_at
+        generation_started_at: float | None = None
+        retrieval_latency_ms: float | None = None
+        generation_latency_ms: float | None = None
+        document_id = request.document_id
+        cost_tracker = RequestCostTracker(
+            default_model_name=self.settings.chat_model,
+            prompt_cache_ttl=self.settings.anthropic_prompt_cache_ttl,
+        )
+
+        try:
+            document_id = self._resolve_document_id(request.document_id)
+            if request.retrieval_mode == "cag":
+                context = self._load_cag_context(document_id)
+                citation_context = self._build_citation_context(context.page_documents)
+                if len(citation_context.labeled_context) > self.settings.cag_max_characters:
+                    raise DocumentProcessingError(
+                        "This document is too large for CAG mode. Use chunk/page retrieval or raise the CAG limits."
+                    )
+
+                generation_started_at = perf_counter()
+                retrieval_latency_ms = (generation_started_at - retrieval_started_at) * 1000
+                answer = self._generate_cag_answer(
+                    request.question,
+                    document_id,
+                    citation_context,
+                    cost_tracker=cost_tracker,
                 )
-            answer = self._generate_cag_answer(request.question, document_id, citation_context)
-            citation_verification = self._evaluate_answer_citations(
-                question=request.question,
-                answer=answer,
-                document_id=document_id,
-                citation_context=citation_context,
-            )
+                citation_verification = self._evaluate_answer_citations(
+                    question=request.question,
+                    answer=answer,
+                    document_id=document_id,
+                    citation_context=citation_context,
+                    cost_tracker=cost_tracker,
+                )
+                generation_latency_ms = (perf_counter() - generation_started_at) * 1000
 
-            self.logger.info(
-                "Answered question against document %s using CAG over %s page(s)",
-                document_id,
-                len(context.page_documents),
-            )
+                result = RagQueryResult(
+                    answer=answer,
+                    document_id=document_id,
+                    retrieved_documents=context.page_documents,
+                    sources=citation_context.sources,
+                    citation_verification=citation_verification,
+                )
+                self.logger.info(
+                    "Answered question against document %s using CAG over %s page(s)",
+                    document_id,
+                    len(context.page_documents),
+                )
+            elif request.retrieval_mode == "hybrid":
+                results = self._retrieve_hybrid_documents(request.question, document_id)
+                results = self._optimize_documents_for_question(
+                    question=request.question,
+                    document_id=document_id,
+                    retrieval_mode=request.retrieval_mode,
+                    retrieved_documents=results,
+                )
+                citation_context = self._build_citation_context(results)
 
-            return RagQueryResult(
-                answer=answer,
-                document_id=document_id,
-                retrieved_documents=context.page_documents,
-                sources=citation_context.sources,
-                citation_verification=citation_verification,
-            )
-        if request.retrieval_mode == "hybrid":
-            results = self._retrieve_hybrid_documents(request.question, document_id)
-            results = self._optimize_documents_for_question(
-                question=request.question,
-                document_id=document_id,
+                generation_started_at = perf_counter()
+                retrieval_latency_ms = (generation_started_at - retrieval_started_at) * 1000
+                answer = self._generate_answer(
+                    request.question,
+                    document_id,
+                    citation_context,
+                    cost_tracker=cost_tracker,
+                )
+                citation_verification = self._evaluate_answer_citations(
+                    question=request.question,
+                    answer=answer,
+                    document_id=document_id,
+                    citation_context=citation_context,
+                    cost_tracker=cost_tracker,
+                )
+                generation_latency_ms = (perf_counter() - generation_started_at) * 1000
+
+                result = RagQueryResult(
+                    answer=answer,
+                    document_id=document_id,
+                    retrieved_documents=results,
+                    sources=citation_context.sources,
+                    citation_verification=citation_verification,
+                )
+                self.logger.info(
+                    "Answered question against document %s using hybrid retrieval with %s chunk(s)",
+                    document_id,
+                    len(results),
+                )
+            else:
+                results = self._retrieve_documents(
+                    request.question,
+                    document_id,
+                    request.retrieval_mode,
+                )
+                results = self._optimize_documents_for_question(
+                    question=request.question,
+                    document_id=document_id,
+                    retrieval_mode=request.retrieval_mode,
+                    retrieved_documents=results,
+                )
+                citation_context = self._build_citation_context(results)
+
+                generation_started_at = perf_counter()
+                retrieval_latency_ms = (generation_started_at - retrieval_started_at) * 1000
+                answer = self._generate_answer(
+                    request.question,
+                    document_id,
+                    citation_context,
+                    cost_tracker=cost_tracker,
+                )
+                citation_verification = self._evaluate_answer_citations(
+                    question=request.question,
+                    answer=answer,
+                    document_id=document_id,
+                    citation_context=citation_context,
+                    cost_tracker=cost_tracker,
+                )
+                generation_latency_ms = (perf_counter() - generation_started_at) * 1000
+
+                result = RagQueryResult(
+                    answer=answer,
+                    document_id=document_id,
+                    retrieved_documents=results,
+                    sources=citation_context.sources,
+                    citation_verification=citation_verification,
+                )
+                self.logger.info(
+                    "Answered question against document %s using %s retrieval with %s unit(s)",
+                    document_id,
+                    request.retrieval_mode,
+                    len(results),
+                )
+
+            self._record_chat_observability(
+                request_id=request_id,
+                timestamp=request_timestamp,
                 retrieval_mode=request.retrieval_mode,
-                retrieved_documents=results,
-            )
-            citation_context = self._build_citation_context(results)
-            answer = self._generate_answer(request.question, document_id, citation_context)
-            citation_verification = self._evaluate_answer_citations(
-                question=request.question,
-                answer=answer,
                 document_id=document_id,
-                citation_context=citation_context,
+                success=True,
+                error_type=None,
+                total_latency_ms=(perf_counter() - request_started_at) * 1000,
+                retrieval_latency_ms=retrieval_latency_ms,
+                generation_latency_ms=generation_latency_ms,
+                cost_tracker=cost_tracker,
             )
+            return result
+        except Exception as exc:
+            finished_at = perf_counter()
+            if generation_started_at is not None:
+                if retrieval_latency_ms is None:
+                    retrieval_latency_ms = (generation_started_at - retrieval_started_at) * 1000
+                generation_latency_ms = (finished_at - generation_started_at) * 1000
+            elif retrieval_latency_ms is None:
+                retrieval_latency_ms = (finished_at - retrieval_started_at) * 1000
 
-            self.logger.info(
-                "Answered question against document %s using hybrid retrieval with %s chunk(s)",
-                document_id,
-                len(results),
-            )
-
-            return RagQueryResult(
-                answer=answer,
+            self._record_chat_observability(
+                request_id=request_id,
+                timestamp=request_timestamp,
+                retrieval_mode=request.retrieval_mode,
                 document_id=document_id,
-                retrieved_documents=results,
-                sources=citation_context.sources,
-                citation_verification=citation_verification,
+                success=False,
+                error_type=type(exc).__name__,
+                total_latency_ms=(finished_at - request_started_at) * 1000,
+                retrieval_latency_ms=retrieval_latency_ms,
+                generation_latency_ms=generation_latency_ms,
+                cost_tracker=cost_tracker,
             )
-
-        results = self._retrieve_documents(
-            request.question,
-            document_id,
-            request.retrieval_mode,
-        )
-        results = self._optimize_documents_for_question(
-            question=request.question,
-            document_id=document_id,
-            retrieval_mode=request.retrieval_mode,
-            retrieved_documents=results,
-        )
-        citation_context = self._build_citation_context(results)
-        answer = self._generate_answer(request.question, document_id, citation_context)
-        citation_verification = self._evaluate_answer_citations(
-            question=request.question,
-            answer=answer,
-            document_id=document_id,
-            citation_context=citation_context,
-        )
-
-        self.logger.info(
-            "Answered question against document %s using %s retrieved %s unit(s)",
-            document_id,
-            len(results),
-            request.retrieval_mode,
-        )
-
-        return RagQueryResult(
-            answer=answer,
-            document_id=document_id,
-            retrieved_documents=results,
-            sources=citation_context.sources,
-            citation_verification=citation_verification,
-        )
+            raise
 
     def list_documents(self) -> DocumentListResponse:
         return DocumentListResponse(**self.registry.list_documents())
@@ -696,6 +785,8 @@ class RagService:
         question: str,
         document_id: str,
         citation_context: CitationContext,
+        *,
+        cost_tracker: RequestCostTracker | None = None,
     ) -> str:
         if not citation_context.labeled_context.strip():
             raise DocumentProcessingError("The retrieved context was empty.")
@@ -708,6 +799,8 @@ class RagService:
                     "source_ids": self._format_valid_source_ids(citation_context.sources),
                 }
             )
+            if cost_tracker is not None:
+                cost_tracker.capture(response)
         except ConfigurationError:
             raise
         except Exception as exc:
@@ -786,6 +879,8 @@ class RagService:
         question: str,
         document_id: str,
         citation_context: CitationContext,
+        *,
+        cost_tracker: RequestCostTracker | None = None,
     ) -> str:
         cached_messages = self._build_cag_messages(
             question,
@@ -795,6 +890,8 @@ class RagService:
 
         try:
             response = self._invoke_cag_model(cached_messages)
+            if cost_tracker is not None:
+                cost_tracker.capture(response)
         except ConfigurationError:
             raise
         except Exception as exc:
@@ -810,6 +907,8 @@ class RagService:
             )
             try:
                 response = self._invoke_cag_model(uncached_messages)
+                if cost_tracker is not None:
+                    cost_tracker.capture(response)
             except ConfigurationError:
                 raise
             except Exception as retry_exc:
@@ -1059,6 +1158,7 @@ class RagService:
         answer: str,
         document_id: str,
         citation_context: CitationContext,
+        cost_tracker: RequestCostTracker | None = None,
     ) -> CitationVerification:
         cited_source_ids = self._extract_cited_source_ids(answer)
         valid_source_ids = {source.source_id for source in citation_context.sources}
@@ -1093,6 +1193,7 @@ class RagService:
                 question=question,
                 answer=answer,
                 citation_context=citation_context,
+                cost_tracker=cost_tracker,
             )
             unsupported_claims.extend(evaluator_issues)
         except ConfigurationError:
@@ -1122,6 +1223,7 @@ class RagService:
         question: str,
         answer: str,
         citation_context: CitationContext,
+        cost_tracker: RequestCostTracker | None = None,
     ) -> tuple[bool | None, list[CitationIssue]]:
         if not citation_context.sources:
             return None, []
@@ -1133,6 +1235,8 @@ class RagService:
                 "context": citation_context.labeled_context,
             }
         )
+        if cost_tracker is not None:
+            cost_tracker.capture(response)
         payload = self._parse_grounding_evaluator_payload(response.content)
 
         issues: list[CitationIssue] = []
@@ -1361,7 +1465,37 @@ class RagService:
 
         return str(content).strip()
 
+    def _record_chat_observability(
+        self,
+        *,
+        request_id: str,
+        timestamp: datetime,
+        retrieval_mode: str,
+        document_id: str | None,
+        success: bool,
+        error_type: str | None,
+        total_latency_ms: float,
+        retrieval_latency_ms: float | None,
+        generation_latency_ms: float | None,
+        cost_tracker: RequestCostTracker,
+    ) -> None:
+        self.observability.record_request(
+            request_id=request_id,
+            timestamp=timestamp,
+            retrieval_mode=retrieval_mode,
+            document_id=document_id,
+            success=success,
+            error_type=error_type,
+            total_latency_ms=total_latency_ms,
+            retrieval_latency_ms=retrieval_latency_ms,
+            generation_latency_ms=generation_latency_ms,
+            estimated_cost_usd=cost_tracker.estimated_cost_usd,
+        )
+
 
 @lru_cache
 def get_rag_service() -> RagService:
-    return RagService(get_settings())
+    return RagService(
+        get_settings(),
+        observability=get_observability_service(),
+    )
